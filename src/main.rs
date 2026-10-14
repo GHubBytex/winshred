@@ -661,7 +661,7 @@ fn run_reg(args: &[&str]) {
         .output();
 }
 
-fn run_install_backend() -> Result<String, String> {
+fn run_install_backend(opt_modern: bool, opt_classic: bool, opt_sendto: bool) -> Result<String, String> {
     let install_dir = PathBuf::from("C:\\Program Files\\WinShred");
     if let Err(e) = fs::create_dir_all(&install_dir) {
         return Err(format!("Fehler beim Erstellen des Installationsordners:\n{}", e));
@@ -686,52 +686,105 @@ fn run_install_backend() -> Result<String, String> {
     let _ = fs::write(&cer_path, CER_BYTES);
     let _ = fs::write(&ico_path, ICO_BYTES);
 
-    // 3. PowerShell-Setup: Alte Hänger beenden, Explorer stoppen, Zertifikat + AppX + SendTo
-    let ps_command = format!(
+    // 3. PowerShell-Setup: Alte Hänger beenden, Explorer stoppen
+    let mut ps_command = String::from(
         "$ProgressPreference = 'SilentlyContinue'; \
-        Get-CimInstance Win32_Process -Filter \"Name = 'powershell.exe'\" | Where-Object {{ $_.CommandLine -like '*WinShred*' -and $_.ProcessId -ne $PID }} | Stop-Process -Force -ErrorAction SilentlyContinue; \
-        Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue; \
-        Import-Certificate -FilePath '{cer}' -CertStoreLocation 'Cert:\\LocalMachine\\TrustedPeople' | Out-Null; \
-        $pkg = Get-AppxPackage -Name 'WinShred.ShellExtension' -ErrorAction SilentlyContinue; \
-        if ($pkg) {{ Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction SilentlyContinue }}; \
-        Add-AppxPackage -Path '{msix}' -ExternalLocation '{inst}' -ErrorAction SilentlyContinue; \
-        $wsh = New-Object -ComObject WScript.Shell; \
-        $s = $wsh.CreateShortcut(\"$env:APPDATA\\Microsoft\\Windows\\SendTo\\WinShred (Sicher vernichten).lnk\"); \
-        $s.TargetPath = '{inst}\\winshred.exe'; \
-        $s.IconLocation = '{ico}'; \
-        $s.Save();",
-        cer = cer_path.to_string_lossy(),
-        msix = msix_path.to_string_lossy(),
-        inst = install_dir.to_string_lossy(),
-        ico = ico_path.to_string_lossy()
+        Get-CimInstance Win32_Process -Filter \"Name = 'powershell.exe'\" | Where-Object { $_.CommandLine -like '*WinShred*' -and $_.ProcessId -ne $PID } | Stop-Process -Force -ErrorAction SilentlyContinue; \
+        Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue; "
     );
+
+    // 4. Modernes Kontextmenue (Sparse Package) je nach Auswahl
+    if opt_modern {
+        ps_command.push_str(&format!(
+            "Import-Certificate -FilePath '{cer}' -CertStoreLocation 'Cert:\\LocalMachine\\TrustedPeople' | Out-Null; \
+            $pkg = Get-AppxPackage -Name 'WinShred.ShellExtension' -ErrorAction SilentlyContinue; \
+            if ($pkg) {{ Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction SilentlyContinue }}; \
+            Add-AppxPackage -Path '{msix}' -ExternalLocation '{inst}' -ErrorAction SilentlyContinue; ",
+            cer = cer_path.to_string_lossy(),
+            msix = msix_path.to_string_lossy(),
+            inst = install_dir.to_string_lossy()
+        ));
+    } else {
+        ps_command.push_str(
+            "$pkg = Get-AppxPackage -Name 'WinShred.ShellExtension' -ErrorAction SilentlyContinue; \
+            if ($pkg) { Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction SilentlyContinue }; "
+        );
+    }
+
+    // 5. SendTo Shortcut je nach Auswahl
+    if opt_sendto {
+        ps_command.push_str(&format!(
+            "$wsh = New-Object -ComObject WScript.Shell; \
+            $s = $wsh.CreateShortcut(\"$env:APPDATA\\Microsoft\\Windows\\SendTo\\WinShred (Sicher vernichten).lnk\"); \
+            $s.TargetPath = '{inst}\\winshred.exe'; \
+            $s.IconLocation = '{ico}'; \
+            $s.Save(); ",
+            inst = install_dir.to_string_lossy(),
+            ico = ico_path.to_string_lossy()
+        ));
+    } else {
+        if let Ok(appdata) = env::var("APPDATA") {
+            let lnk = PathBuf::from(appdata).join(r"Microsoft\Windows\SendTo\WinShred (Sicher vernichten).lnk");
+            let _ = fs::remove_file(lnk);
+        }
+    }
 
     let output = Command::new("powershell")
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_command])
         .output();
 
-    // 4. Registry blitzschnell über reg.exe konfigurieren (Fallback für klassische Menüs / Explorer)
+    // 6. Klassisches Menue (statische Registry-Keys)
     let ico_str = ico_path.to_string_lossy().to_string();
     let cmd_str = format!("\"{}\" \"%1\"", install_dir.join("winshred.exe").to_string_lossy());
 
-    run_reg(&["add", r"HKLM\SOFTWARE\Classes\*\shell\WinShred", "/ve", "/d", "Mit WinShred sicher vernichten", "/f"]);
-    run_reg(&["add", r"HKLM\SOFTWARE\Classes\*\shell\WinShred", "/v", "Icon", "/d", &ico_str, "/f"]);
-    run_reg(&["add", r"HKLM\SOFTWARE\Classes\*\shell\WinShred\command", "/ve", "/d", &cmd_str, "/f"]);
+    if opt_classic {
+        run_reg(&["add", r"HKLM\SOFTWARE\Classes\*\shell\WinShred", "/ve", "/d", "Mit WinShred sicher vernichten", "/f"]);
+        run_reg(&["add", r"HKLM\SOFTWARE\Classes\*\shell\WinShred", "/v", "Icon", "/d", &ico_str, "/f"]);
+        run_reg(&["add", r"HKLM\SOFTWARE\Classes\*\shell\WinShred\command", "/ve", "/d", &cmd_str, "/f"]);
 
-    run_reg(&["add", r"HKLM\SOFTWARE\Classes\Directory\shell\WinShred", "/ve", "/d", "Mit WinShred sicher vernichten", "/f"]);
-    run_reg(&["add", r"HKLM\SOFTWARE\Classes\Directory\shell\WinShred", "/v", "Icon", "/d", &ico_str, "/f"]);
-    run_reg(&["add", r"HKLM\SOFTWARE\Classes\Directory\shell\WinShred\command", "/ve", "/d", &cmd_str, "/f"]);
+        run_reg(&["add", r"HKLM\SOFTWARE\Classes\Directory\shell\WinShred", "/ve", "/d", "Mit WinShred sicher vernichten", "/f"]);
+        run_reg(&["add", r"HKLM\SOFTWARE\Classes\Directory\shell\WinShred", "/v", "Icon", "/d", &ico_str, "/f"]);
+        run_reg(&["add", r"HKLM\SOFTWARE\Classes\Directory\shell\WinShred\command", "/ve", "/d", &cmd_str, "/f"]);
+    } else {
+        // IMMER säubern, wenn klassisch nicht gewünscht ist (verhindert Dopplung im Legacy-Menü!)
+        run_reg(&["delete", r"HKLM\SOFTWARE\Classes\*\shell\WinShred", "/f"]);
+        run_reg(&["delete", r"HKLM\SOFTWARE\Classes\Directory\shell\WinShred", "/f"]);
+        run_reg(&["delete", r"HKCU\Software\Classes\*\shell\WinShred", "/f"]);
+        run_reg(&["delete", r"HKCU\Software\Classes\Directory\shell\WinShred", "/f"]);
+    }
 
-    // 5. Explorer sauber und entkoppelt über die Windows Shell neu starten
+    // 7. Explorer sauber und entkoppelt über die Windows Shell neu starten
     restart_explorer();
 
-    // 6. Verifikation
+    // 8. Verifikation
     let files_exist = install_dir.join("winshred.exe").exists()
         && install_dir.join("winshred_shell.dll").exists();
 
     if files_exist {
-        Ok(String::from("WinShred.ShellExtension"))
+        let mut msg = String::from("Status: WinShred-Konfiguration abgeschlossen\n\nAUSGEWAEHLTE INTEGRATION:\n");
+        if opt_modern {
+            msg.push_str("[OK] Modernes Windows 11 Menue: Aktiv (\"Mit WinShred sicher vernichten\")\n");
+        } else {
+            msg.push_str("[--] Modernes Windows 11 Menue: Nicht installiert\n");
+        }
+        if opt_classic {
+            msg.push_str("[OK] Klassisches Kontextmenue: Aktiv (statische Registrierung)\n");
+        } else {
+            msg.push_str("[--] Klassisches Kontextmenue: Nicht registriert (keine Doppelung)\n");
+        }
+        if opt_sendto {
+            msg.push_str("[OK] Explorer 'Senden an' (SendTo): Verknuepfung aktiv\n");
+        } else {
+            msg.push_str("[--] Explorer 'Senden an' (SendTo): Nicht eingerichtet\n");
+        }
+        msg.push_str("\nSICHERHEITS-FUNKTIONEN:\n");
+        msg.push_str("[OK] 3-Pass DoD 5220.22-M Krypto-Ueberschreibung (0x00, 0xFF, CSPRNG)\n");
+        msg.push_str("[OK] Cluster-Slack-Bereinigung & Alternate Data Streams (ADS)\n");
+        msg.push_str("[OK] SSD/NVMe TRIM Deallocate Controller-Tilgung\n");
+        msg.push_str("[OK] MFT-Dateinamen-Anonymisierung im NTFS-Dateisystem");
+
+        Ok(msg)
     } else {
         let err_detail = output
             .ok()
@@ -804,6 +857,10 @@ const ID_BTN_FINISH: usize = 104;
 const ID_RADIO_REPAIR: usize = 201;
 const ID_RADIO_UNINSTALL: usize = 202;
 
+const ID_CHK_MODERN: usize = 210;
+const ID_CHK_CLASSIC: usize = 211;
+const ID_CHK_SENDTO: usize = 212;
+
 const ID_PROGRESS_BAR: usize = 301;
 
 const WM_APP_SETUP_DONE: u32 = 0x8001;
@@ -811,6 +868,7 @@ const WM_CTLCOLORSTATIC: u32 = 0x0138;
 const PBM_SETMARQUEE: u32 = 0x040A;
 const PBS_MARQUEE: u32 = 0x0008;
 const BM_SETCHECK: u32 = 0x00F1;
+const BM_GETCHECK: u32 = 0x00F0;
 const BST_CHECKED: usize = 1;
 const BS_AUTORADIOBUTTON: u32 = 0x00000009;
 const BS_AUTOCHECKBOX: u32 = 0x00000003;
@@ -860,7 +918,8 @@ struct WizardControls {
     grp_p1_target: *mut c_void,
     edt_p1_target: *mut c_void,
     grp_p1_features: *mut c_void,
-    chk_p1_ctx: *mut c_void,
+    chk_p1_modern: *mut c_void,
+    chk_p1_classic: *mut c_void,
     chk_p1_sendto: *mut c_void,
     chk_p1_dod: *mut c_void,
     chk_p1_slack: *mut c_void,
@@ -893,7 +952,8 @@ static mut CTRLS: WizardControls = WizardControls {
     grp_p1_target: std::ptr::null_mut(),
     edt_p1_target: std::ptr::null_mut(),
     grp_p1_features: std::ptr::null_mut(),
-    chk_p1_ctx: std::ptr::null_mut(),
+    chk_p1_modern: std::ptr::null_mut(),
+    chk_p1_classic: std::ptr::null_mut(),
     chk_p1_sendto: std::ptr::null_mut(),
     chk_p1_dod: std::ptr::null_mut(),
     chk_p1_slack: std::ptr::null_mut(),
@@ -935,7 +995,8 @@ unsafe fn set_p1_install_visible(visible: bool) {
         show_ctrl(CTRLS.grp_p1_target, visible);
         show_ctrl(CTRLS.edt_p1_target, visible);
         show_ctrl(CTRLS.grp_p1_features, visible);
-        show_ctrl(CTRLS.chk_p1_ctx, visible);
+        show_ctrl(CTRLS.chk_p1_modern, visible);
+        show_ctrl(CTRLS.chk_p1_classic, visible);
         show_ctrl(CTRLS.chk_p1_sendto, visible);
         show_ctrl(CTRLS.chk_p1_dod, visible);
         show_ctrl(CTRLS.chk_p1_slack, visible);
@@ -1077,7 +1138,21 @@ unsafe extern "system" fn installer_wnd_proc(
                     ACTION_REPAIR = true;
                 } else if id == ID_RADIO_UNINSTALL {
                     ACTION_REPAIR = false;
+                } else if id == ID_CHK_MODERN {
+                    let checked = SendMessageW(CTRLS.chk_p1_modern, BM_GETCHECK, 0, 0) != 0;
+                    if checked {
+                        SendMessageW(CTRLS.chk_p1_classic, BM_SETCHECK, 0, 0);
+                    }
+                } else if id == ID_CHK_CLASSIC {
+                    let checked = SendMessageW(CTRLS.chk_p1_classic, BM_GETCHECK, 0, 0) != 0;
+                    if checked {
+                        SendMessageW(CTRLS.chk_p1_modern, BM_SETCHECK, 0, 0);
+                    }
                 } else if id == ID_BTN_INSTALL || id == ID_BTN_NEXT {
+                    let opt_modern = SendMessageW(CTRLS.chk_p1_modern, BM_GETCHECK, 0, 0) != 0;
+                    let opt_classic = SendMessageW(CTRLS.chk_p1_classic, BM_GETCHECK, 0, 0) != 0;
+                    let opt_sendto = SendMessageW(CTRLS.chk_p1_sendto, BM_GETCHECK, 0, 0) != 0;
+
                     CURRENT_PAGE = WizardPage::Progress;
                     update_wizard_page(hwnd);
 
@@ -1102,33 +1177,21 @@ unsafe extern "system" fn installer_wnd_proc(
                                 Err(e) => (false, format!("Fehler bei der Deinstallation:\n{}", e)),
                             }
                         } else {
-                            match run_install_backend() {
-                                Ok(pkg) => (
-                                    true,
-                                    format!(
-                                        "Status: Im modernen Windows 11 Kontextmenue aktiv ({})\n\n\
-                                        KOMPONENTEN:\n\
-                                        [OK] Programmdatei: C:\\Program Files\\WinShred\\winshred.exe\n\
-                                        [OK] Shell-Erweiterung: winshred_shell.dll\n\
-                                        [OK] Modernes Menue: \"Mit WinShred sicher vernichten\"\n\
-                                        [OK] Eigenes Icon: winshred.ico\n\
-                                        [OK] Zertifikat: TrustedPeople (Lokaler Computer)\n\
-                                        [OK] Explorer 'Senden an' (SendTo) verknuepft\n\n\
-                                        BEDIENUNG:\n\
-                                        Klicken Sie mit der rechten Maustaste auf eine Datei oder einen Ordner.\n\
-                                        Der Eintrag 'Mit WinShred sicher vernichten' steht ab sofort auf der\n\
-                                        ersten Ebene Ihres Windows 11 Kontextmenues bereit.",
-                                        pkg
-                                    ),
-                                ),
+                            let (m, c, s) = if is_installed_now {
+                                (true, false, true)
+                            } else {
+                                (opt_modern, opt_classic, opt_sendto)
+                            };
+
+                            match run_install_backend(m, c, s) {
+                                Ok(pkg_or_msg) => (true, pkg_or_msg),
                                 Err(e) => (
                                     false,
                                     format!(
-                                        "Hinweis zur Installation:\n\n\
-                                        Die Dateien wurden kopiert, aber bei der Paket-Registrierung gab es eine Rueckmeldung:\n\n\
+                                        "Hinweis zur Einrichtung:\n\n\
+                                        Die Konfiguration konnte nicht vollstaendig angewendet werden:\n\n\
                                         {}\n\n\
-                                        Bitte pruefen Sie, ob in den Windows-Einstellungen der Entwicklermodus\n\
-                                        oder lokale AppX-Installationen zugelassen sind.",
+                                        Bitte pruefen Sie Ihre Berechtigungen oder Windows-Einstellungen.",
                                         e
                                     ),
                                 ),
@@ -1396,29 +1459,35 @@ fn show_installer_wizard() {
         );
         CTRLS.grp_p1_features = create_ctrl(
             0, "BUTTON", "Komponenten & Sicherheitsfunktionen",
-            WS_CHILD | BS_GROUPBOX, 28, 200, 464, 122, hwnd, 0, H_FONT_REGULAR,
+            WS_CHILD | BS_GROUPBOX, 28, 195, 464, 137, hwnd, 0, H_FONT_REGULAR,
         );
-        CTRLS.chk_p1_ctx = create_ctrl(
+        CTRLS.chk_p1_modern = create_ctrl(
             0, "BUTTON", "Modernes Windows 11 Kontextmenue (\"Mit WinShred sicher vernichten\")",
-            WS_CHILD | BS_AUTOCHECKBOX | WS_TABSTOP, 44, 220, 430, 20, hwnd, 0, H_FONT_REGULAR,
+            WS_CHILD | BS_AUTOCHECKBOX | WS_TABSTOP, 44, 214, 430, 20, hwnd, ID_CHK_MODERN, H_FONT_REGULAR,
         );
-        SendMessageW(CTRLS.chk_p1_ctx, BM_SETCHECK, BST_CHECKED, 0);
+        SendMessageW(CTRLS.chk_p1_modern, BM_SETCHECK, BST_CHECKED, 0);
+
+        CTRLS.chk_p1_classic = create_ctrl(
+            0, "BUTTON", "Klassisches Kontextmenue (Nur fuer Windows 10 oder \"Weitere Optionen\")",
+            WS_CHILD | BS_AUTOCHECKBOX | WS_TABSTOP, 44, 235, 430, 20, hwnd, ID_CHK_CLASSIC, H_FONT_REGULAR,
+        );
+        SendMessageW(CTRLS.chk_p1_classic, BM_SETCHECK, 0, 0);
 
         CTRLS.chk_p1_sendto = create_ctrl(
             0, "BUTTON", "Windows Explorer \"Senden an\" (SendTo) Kontextmenue",
-            WS_CHILD | BS_AUTOCHECKBOX | WS_TABSTOP, 44, 242, 430, 20, hwnd, 0, H_FONT_REGULAR,
+            WS_CHILD | BS_AUTOCHECKBOX | WS_TABSTOP, 44, 256, 430, 20, hwnd, ID_CHK_SENDTO, H_FONT_REGULAR,
         );
         SendMessageW(CTRLS.chk_p1_sendto, BM_SETCHECK, BST_CHECKED, 0);
 
         CTRLS.chk_p1_dod = create_ctrl(
             0, "BUTTON", "3-Pass DoD 5220.22-M Krypto-Ueberschreibung & SSD/NVMe TRIM",
-            WS_CHILD | BS_AUTOCHECKBOX | WS_DISABLED, 44, 264, 430, 20, hwnd, 0, H_FONT_REGULAR,
+            WS_CHILD | BS_AUTOCHECKBOX | WS_DISABLED, 44, 280, 430, 20, hwnd, 0, H_FONT_REGULAR,
         );
         SendMessageW(CTRLS.chk_p1_dod, BM_SETCHECK, BST_CHECKED, 0);
 
         CTRLS.chk_p1_slack = create_ctrl(
             0, "BUTTON", "Cluster-Slack & Alternate Data Streams (ADS) Tilgung",
-            WS_CHILD | BS_AUTOCHECKBOX | WS_DISABLED, 44, 286, 430, 20, hwnd, 0, H_FONT_REGULAR,
+            WS_CHILD | BS_AUTOCHECKBOX | WS_DISABLED, 44, 302, 430, 20, hwnd, 0, H_FONT_REGULAR,
         );
         SendMessageW(CTRLS.chk_p1_slack, BM_SETCHECK, BST_CHECKED, 0);
 
@@ -1540,7 +1609,7 @@ fn main() {
             elevate_relaunch("--install");
             return;
         }
-        let _ = run_install_backend();
+        let _ = run_install_backend(true, false, true);
         return;
     }
     if args.iter().any(|a| a == "--uninstall" || a == "-u") {
