@@ -228,7 +228,12 @@ unsafe extern "system" fn cmd_get_icon(
     if ppsz_icon.is_null() {
         return E_POINTER;
     }
-    *ppsz_icon = alloc_co_string("imageres.dll,-5308");
+    let icon_path = "C:\\Program Files\\WinShred\\winshred.ico";
+    if PathBuf::from(icon_path).exists() {
+        *ppsz_icon = alloc_co_string(icon_path);
+    } else {
+        *ppsz_icon = alloc_co_string("imageres.dll,-5308");
+    }
     if (*ppsz_icon).is_null() {
         E_FAIL
     } else {
