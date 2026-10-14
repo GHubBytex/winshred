@@ -44,8 +44,8 @@ echo [OK] Windows SDK gefunden: %SDK_BIN%
 echo.
 
 :: 3. Icon aus Bild generieren (falls vorhanden)
-if exist "assets\Gemini_Generated_Image_3wywxm3wywxm3wyw.jpg" (
-    echo [1/6] Generiere gezoomte Icons aus Grafik...
+if exist "assets\icon.png" (
+    echo [1/6] Generiere Icons aus assets\icon.png...
     python assets\generate_icons.py
 )
 

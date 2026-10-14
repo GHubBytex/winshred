@@ -1,7 +1,13 @@
-# WinShred 🛡️🗑️
+<div align="center">
 
-> **Forensisch sichere, unwiderrufliche Datei- und Ordnervernichtung für Windows 11.**  
-> Vollständig integriert in das moderne Windows 11 Kontextmenü (*"Mit WinShred sicher vernichten"*) auf der ersten Menüebene – ohne *"Weitere Optionen anzeigen"*.
+<img src="assets/icon.png" alt="WinShred Logo" width="128" height="128" />
+
+# WinShred
+
+**Forensisch sichere, unwiderrufliche Datei- und Ordnervernichtung für Windows 11.**  
+Vollständig integriert in das moderne Windows 11 Kontextmenü (*"Mit WinShred sicher vernichten"*) auf der ersten Menüebene – ohne *"Weitere Optionen anzeigen"*.
+
+</div>
 
 ---
 
@@ -17,9 +23,9 @@ winshred/
 ├── winshred.exe                # Portables, lauffähiges Endprodukt (Single-File Binary)
 │
 ├── assets/                     # Grafiken & Bildmaterial
-│   ├── Gemini_Generated_Image...jpg # Quellgrafik
+│   ├── icon.png                # Quellgrafik (2048x2048)
 │   ├── winshred.ico            # Multi-Resolution Windows Icon (16x16 bis 256x256)
-│   └── generate_icons.py       # Bildbeschneidung & Icon-Generator
+│   └── generate_icons.py       # Icon-Generator für alle Plattformen
 │
 ├── packaging/                  # Windows 11 Sparse MSIX Paket
 │   ├── package_src/            # Paket-Inhalte (AppxManifest.xml, PNG-Kacheln)
@@ -73,7 +79,7 @@ winshred/
 
 ## 🔨 Bauen (Build)
 
-Führen Sie einfach das Skript [build.bat](file:///A:/Code/01%20TEMP/REA/winshred/build.bat) aus oder führen Sie die Schritte manuell aus:
+Führen Sie einfach das Skript [build.bat](file:///a:/Code/winshred/build.bat) aus oder führen Sie die Schritte manuell aus:
 
 ```cmd
 :: 1. Shell-DLL kompilieren
@@ -84,4 +90,12 @@ cd ..
 :: 2. Hauptprogramm mit eingebetteter DLL bauen
 cargo build --release
 ```
+
+---
+
+## 📄 Lizenz
+
+Copyright (C) 2026 WinShred. Alle Rechte vorbehalten.  
+Details finden sich in der Datei [LICENSE](file:///a:/Code/winshred/LICENSE).
+
 
