@@ -1,6 +1,13 @@
 # WinShred - Kontextmenü-Deinstaller
 $ErrorActionPreference = "SilentlyContinue"
 
+# Automatische UAC-Administrator-Elevation
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "Fordere Administratorrechte an..." -ForegroundColor Yellow
+    Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
+    exit
+}
+
 Write-Host "Entferne WinShred aus dem Kontextmenue..." -ForegroundColor Yellow
 
 # 1. Registry Einträge löschen
@@ -14,4 +21,4 @@ if (Test-Path $sendToShortcut) {
 }
 
 Write-Host "WinShred wurde vollstaendig aus dem Kontextmenue entfernt." -ForegroundColor Green
-
+Start-Sleep -Seconds 2

@@ -1,14 +1,26 @@
 # WinShred - Kontextmenü-Installer
 $ErrorActionPreference = "Stop"
 
+# Automatische UAC-Administrator-Elevation
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "Fordere Administratorrechte an..." -ForegroundColor Yellow
+    Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
+    exit
+}
+
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$exePath = Join-Path $scriptDir "target\release\winshred.exe"
+$exePath = Join-Path $scriptDir "bin\winshred.exe"
+
+if (-not (Test-Path $exePath)) {
+    $exePath = Join-Path $scriptDir "target\release\winshred.exe"
+}
 
 if (-not (Test-Path $exePath)) {
     Write-Host "Kompiliere WinShred Release..." -ForegroundColor Cyan
     Push-Location $scriptDir
     cargo build --release
     Pop-Location
+    $exePath = Join-Path $scriptDir "target\release\winshred.exe"
 }
 
 if (-not (Test-Path $exePath)) {
@@ -53,4 +65,4 @@ if (Test-Path $sendToPath) {
 
 Write-Host "`nErfolgreich installiert!" -ForegroundColor Cyan
 Write-Host "Du kannst nun jede Datei oder jeden Ordner rechtsklicken und 'Mit WinShred sicher vernichten' waehlen." -ForegroundColor Yellow
-
+Start-Sleep -Seconds 2
