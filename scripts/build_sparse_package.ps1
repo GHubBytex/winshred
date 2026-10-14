@@ -1,17 +1,13 @@
 # Script zum Bauen, Signieren und Installieren des Sparse Packages für Windows 11
 $ErrorActionPreference = "Stop"
 
-$baseDir = "A:\Code\01 TEMP\REA\winshred"
-$binDir = Join-Path $baseDir "bin"
-$pkgSrcDir = Join-Path $baseDir "package_src"
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$baseDir = Split-Path -Parent $scriptDir
+$pkgSrcDir = Join-Path $baseDir "packaging\package_src"
 $assetsDir = Join-Path $pkgSrcDir "Assets"
 $makeAppx = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\makeappx.exe"
 $signTool = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe"
-$msixPath = Join-Path $baseDir "winshred.msix"
-
-Write-Host "1. Erstelle Verzeichnisse..." -ForegroundColor Cyan
-New-Item -ItemType Directory -Force -Path $binDir | Out-Null
-New-Item -ItemType Directory -Force -Path $assetsDir | Out-Null
+$msixPath = Join-Path $baseDir "packaging\winshred.msix"
 
 Write-Host "2. Kompiliere Binaries..." -ForegroundColor Cyan
 Push-Location $baseDir

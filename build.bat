@@ -44,9 +44,9 @@ echo [OK] Windows SDK gefunden: %SDK_BIN%
 echo.
 
 :: 3. Icon aus Bild generieren (falls vorhanden)
-if exist "Gemini_Generated_Image_3wywxm3wywxm3wyw.jpg" (
-    echo [1/6] Generiere hochaufloesende Icons aus Gemini-Grafik...
-    python -c "from PIL import Image; import os; img = Image.open('Gemini_Generated_Image_3wywxm3wywxm3wyw.jpg').convert('RGBA'); os.makedirs('package_src/Assets', exist_ok=True); img.resize((150, 150), Image.Resampling.LANCZOS).save('package_src/Assets/Square150x150Logo.png', 'PNG'); img.resize((44, 44), Image.Resampling.LANCZOS).save('package_src/Assets/Square44x44Logo.png', 'PNG'); img.resize((50, 50), Image.Resampling.LANCZOS).save('package_src/Assets/StoreLogo.png', 'PNG'); img.save('winshred.ico', format='ICO', sizes=[(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (24, 24), (16, 16)]); img.save('winshred_shell/winshred.ico', format='ICO', sizes=[(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (24, 24), (16, 16)])" >nul 2>&1
+if exist "assets\Gemini_Generated_Image_3wywxm3wywxm3wyw.jpg" (
+    echo [1/6] Generiere gezoomte Icons aus Grafik...
+    python assets\generate_icons.py
 )
 
 :: 4. Zertifikat pruefen oder erstellen
@@ -56,10 +56,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "if (-not $cert) { " ^
     "    $cert = New-SelfSignedCertificate -Type Custom -Subject 'CN=WinShred' -KeyUsage DigitalSignature -FriendlyName 'WinShred' -CertStoreLocation 'Cert:\CurrentUser\My' -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3'); " ^
     "} " ^
-    "Export-Certificate -Cert $cert -FilePath 'winshred.cer' -Force | Out-Null;"
+    "Export-Certificate -Cert $cert -FilePath 'packaging\winshred.cer' -Force | Out-Null;"
 
-if not exist "winshred.cer" (
-    echo [FEHLER] winshred.cer konnte nicht erzeugt werden!
+if not exist "packaging\winshred.cer" (
+    echo [FEHLER] packaging\winshred.cer konnte nicht erzeugt werden!
     pause
     exit /b 1
 )
@@ -77,16 +77,16 @@ if %errorlevel% neq 0 (
 popd
 
 :: 6. Sparse Package packen und signieren
-echo [4/6] Erstelle und signiere Windows 11 Sparse Package winshred.msix...
-if exist "winshred.msix" del /f /q "winshred.msix"
-"%SDK_BIN%\makeappx.exe" pack /d "package_src" /p "winshred.msix" /nv /o >nul
+echo [4/6] Erstelle und signiere Windows 11 Sparse Package packaging\winshred.msix...
+if exist "packaging\winshred.msix" del /f /q "packaging\winshred.msix"
+"%SDK_BIN%\makeappx.exe" pack /d "packaging\package_src" /p "packaging\winshred.msix" /nv /o >nul
 if %errorlevel% neq 0 (
     echo [FEHLER] makeappx.exe fehlgeschlagen!
     pause
     exit /b 1
 )
 
-"%SDK_BIN%\signtool.exe" sign /fd SHA256 /a /n "WinShred" "winshred.msix" >nul
+"%SDK_BIN%\signtool.exe" sign /fd SHA256 /a /n "WinShred" "packaging\winshred.msix" >nul
 if %errorlevel% neq 0 (
     echo [FEHLER] signtool.exe fehlgeschlagen!
     pause

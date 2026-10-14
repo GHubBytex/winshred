@@ -9,18 +9,19 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 }
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$exePath = Join-Path $scriptDir "bin\winshred.exe"
+$rootDir = Split-Path -Parent $scriptDir
+$exePath = Join-Path $rootDir "winshred.exe"
 
 if (-not (Test-Path $exePath)) {
-    $exePath = Join-Path $scriptDir "target\release\winshred.exe"
+    $exePath = Join-Path $rootDir "target\release\winshred.exe"
 }
 
 if (-not (Test-Path $exePath)) {
     Write-Host "Kompiliere WinShred Release..." -ForegroundColor Cyan
-    Push-Location $scriptDir
+    Push-Location $rootDir
     cargo build --release
     Pop-Location
-    $exePath = Join-Path $scriptDir "target\release\winshred.exe"
+    $exePath = Join-Path $rootDir "target\release\winshred.exe"
 }
 
 if (-not (Test-Path $exePath)) {
