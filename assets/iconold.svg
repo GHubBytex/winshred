@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 491.52 500.607">
+  <defs>
+    <style>
+      .cls-1{fill:#ed1c24;stroke:#ed1c24;stroke-width:18;stroke-linecap:round;stroke-linejoin:bevel}
+      .cls-2{fill:#ed1c24;stroke:#ed1c24;stroke-width:19;stroke-linecap:round;stroke-linejoin:bevel}
+      .cls-3{fill:#ed1c24;stroke:#ed1c24;stroke-width:18;stroke-miterlimit:10}
+    </style>
+  </defs>
+  <title>Gemini_Generated_Image_vqldm0vqldm0vqld.jpg</title>
+  <g id="Layer_1" data-name="Layer 1">
+    <path d="M301.996 9.094 L101.688 9.094" class="cls-1"/>
+    <path d="M301.996 9.094 L301.996 98.932" class="cls-1"/>
+    <path d="M19.553 230.568 L19.553 278.691" class="cls-2"/>
+    <path d="M471.967 230.568 L471.967 278.691" class="cls-2"/>
+    <path d="M392.002 98.932 L301.996 98.932" class="cls-1"/>
+    <path d="M391.797 98.953 L301.925 9" class="cls-1"/>
+    <path d="M101.688 9.094 L101.688 197.763" class="cls-3"/>
+    <path d="M392.002 98.932 L392.002 202.259" class="cls-3"/>
+    <path d="M149.338 310.712 L149.338 473.959" class="cls-3"/>
+    <path d="M101.688 310.712 L101.688 405.13" class="cls-3"/>
+    <path d="M197.871 310.712 L197.871 473.959" class="cls-3"/>
+    <g>
+      <path d="M245.521 310.712 L245.521 491.607" class="cls-3"/>
+    </g>
+    <path d="M341.705 310.712 L341.705 478.371" class="cls-3"/>
+    <path d="M293.613 310.712 L293.613 429.536" class="cls-3"/>
+    <path d="M392.002 310.712 L392.002 473.959" class="cls-3"/>
+    <path d="M471.967 229.257 L19.553 229.257" class="cls-2"/>
+    <path d="M471.967 278.691 L19.553 278.691" class="cls-2"/>
+  </g>
+</svg>

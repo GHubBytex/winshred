@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 491.52 500.607">
+  <defs>
+    <style>
+      .cls-1{fill:#ed1c24;stroke:#ed1c24;stroke-width:18;stroke-linecap:round;stroke-linejoin:bevel}
+      .cls-2{fill:#ed1c24;stroke:#ed1c24;stroke-width:18;stroke-miterlimit:10}
+      .cls-3{fill:#ed1c24;stroke:#ed1c24;stroke-width:19;stroke-linecap:round;stroke-linejoin:bevel}
+    </style>
+  </defs>
+  <title>Gemini_Generated_Image_vqldm0vqldm0vqld.jpg</title>
+  <g id="Layer_1" data-name="Layer 1">
+    <g>
+      <path d="M301.996 9.094 L101.688 9.094" class="cls-1"/>
+      <path d="M301.996 9.094 L301.996 98.932" class="cls-1"/>
+      <path d="M392.002 98.932 L301.996 98.932" class="cls-1"/>
+      <path d="M391.797 98.953 L301.925 9" class="cls-1"/>
+      <path d="M101.688 9.094 L101.688 235.045" class="cls-2"/>
+      <path d="M392.002 98.932 L392.002 235.045" class="cls-2"/>
+    </g>
+    <g>
+      <path d="M149.338 347.995 L149.338 477.596" class="cls-2"/>
+      <path d="M101.688 347.995 L101.688 422.953" class="cls-2"/>
+      <path d="M197.871 347.995 L197.871 460.17" class="cls-2"/>
+      <path d="M245.521 347.995 L245.521 491.607" class="cls-2"/>
+      <path d="M342.391 347.998 L341.037 479.301" class="cls-2"/>
+      <path d="M293.613 347.995 L293.613 442.329" class="cls-2"/>
+      <path d="M392.002 347.995 L392.002 479.301" class="cls-2"/>
+    </g>
+    <g>
+      <path d="M19.553 267.851 L19.553 315.974" class="cls-3"/>
+      <path d="M471.967 267.851 L471.967 315.974" class="cls-3"/>
+      <path d="M471.967 266.539 L19.553 266.539" class="cls-3"/>
+      <path d="M471.967 315.974 L19.553 315.974" class="cls-3"/>
+    </g>
+    <path d="M179.435 76.041 L135.675 76.041" class="cls-1"/>
+    <path d="M205.769 141.93 L135.675 141.93" class="cls-1"/>
+    <path d="M349.85 141.93 L268.385 141.93" class="cls-1"/>
+    <path d="M330.492 175.121 L209.707 175.121" class="cls-1"/>
+    <path d="M267.136 109.053 L222.846 109.053" class="cls-1"/>
+    <path d="M161.354 109.053 L135.673 109.053" class="cls-1"/>
+    <path d="M357.77 208.133 L135.675 208.133" class="cls-1"/>
+    <path d="M249.534 43.063 L135.675 43.063" class="cls-1"/>
+  </g>
+</svg>
