@@ -17,6 +17,7 @@ const SHELL_DLL_BYTES: &[u8] = include_bytes!("../winshred_shell/target/release/
 const MSIX_BYTES: &[u8] = include_bytes!("../packaging/winshred.msix");
 const CER_BYTES: &[u8] = include_bytes!("../packaging/winshred.cer");
 const ICO_BYTES: &[u8] = include_bytes!("../assets/winshred.ico");
+const LICENSE_TEXT: &str = include_str!("../LICENSE");
 
 // ==========================================
 // Win32 API Bindings & Structs
@@ -855,6 +856,7 @@ fn run_install_backend(opt_modern: bool, opt_classic: bool, opt_sendto: bool) ->
     let msix_path = install_dir.join("winshred.msix");
     let cer_path = install_dir.join("winshred.cer");
     let ico_path = install_dir.join("winshred.ico");
+    let lic_path = install_dir.join("LICENSE.txt");
 
     let mut write_dll_ok = false;
     for _ in 0..5 {
@@ -870,6 +872,7 @@ fn run_install_backend(opt_modern: bool, opt_classic: bool, opt_sendto: bool) ->
     let _ = fs::write(&msix_path, MSIX_BYTES);
     let _ = fs::write(&cer_path, CER_BYTES);
     let _ = fs::write(&ico_path, ICO_BYTES);
+    let _ = fs::write(&lic_path, LICENSE_TEXT);
 
     // 4. Modernes Kontextmenue (Sparse Package) je nach Auswahl
     let mut ps_command = String::from("$ProgressPreference = 'SilentlyContinue'; ");
@@ -1020,6 +1023,7 @@ fn run_uninstall_backend() -> Result<(), String> {
     let _ = fs::remove_file(install_dir.join("winshred.msix"));
     let _ = fs::remove_file(install_dir.join("winshred.cer"));
     let _ = fs::remove_file(install_dir.join("winshred.ico"));
+    let _ = fs::remove_file(install_dir.join("LICENSE.txt"));
 
     if let Ok(current_exe) = env::current_exe() {
         if !current_exe.starts_with(&install_dir) {
@@ -1046,6 +1050,7 @@ fn run_uninstall_backend() -> Result<(), String> {
 // Windows Installer Wizard (Wizard97 Layout)
 // ==========================================
 
+const ID_BTN_BACK: usize = 100;
 const ID_BTN_INSTALL: usize = 101;
 const ID_BTN_NEXT: usize = 102;
 const ID_BTN_CANCEL: usize = 103;
@@ -1053,6 +1058,8 @@ const ID_BTN_FINISH: usize = 104;
 
 const ID_RADIO_REPAIR: usize = 201;
 const ID_RADIO_UNINSTALL: usize = 202;
+const ID_RAD_LIC_ACCEPT: usize = 205;
+const ID_RAD_LIC_DECLINE: usize = 206;
 
 const ID_CHK_MODERN: usize = 210;
 const ID_CHK_CLASSIC: usize = 211;
@@ -1072,12 +1079,15 @@ const BS_AUTOCHECKBOX: u32 = 0x00000003;
 const BS_GROUPBOX: u32 = 0x00000007;
 const BS_DEFPUSHBUTTON: u32 = 0x00000001;
 const BS_PUSHBUTTON: u32 = 0x00000000;
+const ES_MULTILINE: u32 = 0x0004;
+const ES_AUTOVSCROLL: u32 = 0x0040;
 const ES_READONLY: u32 = 0x0800;
 const ES_AUTOHSCROLL: u32 = 0x0080;
 const WS_CHILD: u32 = 0x40000000;
 const WS_VISIBLE: u32 = 0x10000000;
 const WS_TABSTOP: u32 = 0x00010000;
 const WS_BORDER: u32 = 0x00800000;
+const WS_VSCROLL: u32 = 0x00200000;
 const WS_GROUP: u32 = 0x00020000;
 const WS_DISABLED: u32 = 0x08000000;
 const WM_SETFONT: u32 = 0x0030;
@@ -1088,6 +1098,7 @@ const WM_CLOSE: u32 = 0x0010;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WizardPage {
+    License,
     Config,
     Progress,
     Finish,
@@ -1110,6 +1121,11 @@ static mut H_BRUSH_LINE: *mut c_void = std::ptr::null_mut();
 static SETUP_RESULT: std::sync::Mutex<(bool, String)> = std::sync::Mutex::new((true, String::new()));
 
 struct WizardControls {
+    lbl_lic_prompt: *mut c_void,
+    edt_lic_text: *mut c_void,
+    rad_lic_accept: *mut c_void,
+    rad_lic_decline: *mut c_void,
+
     lbl_p1_title: *mut c_void,
     lbl_p1_desc: *mut c_void,
     grp_p1_target: *mut c_void,
@@ -1137,6 +1153,7 @@ struct WizardControls {
     lbl_p3_title: *mut c_void,
     lbl_p3_summary: *mut c_void,
 
+    btn_back: *mut c_void,
     btn_install: *mut c_void,
     btn_next: *mut c_void,
     btn_cancel: *mut c_void,
@@ -1144,6 +1161,11 @@ struct WizardControls {
 }
 
 static mut CTRLS: WizardControls = WizardControls {
+    lbl_lic_prompt: std::ptr::null_mut(),
+    edt_lic_text: std::ptr::null_mut(),
+    rad_lic_accept: std::ptr::null_mut(),
+    rad_lic_decline: std::ptr::null_mut(),
+
     lbl_p1_title: std::ptr::null_mut(),
     lbl_p1_desc: std::ptr::null_mut(),
     grp_p1_target: std::ptr::null_mut(),
@@ -1171,6 +1193,7 @@ static mut CTRLS: WizardControls = WizardControls {
     lbl_p3_title: std::ptr::null_mut(),
     lbl_p3_summary: std::ptr::null_mut(),
 
+    btn_back: std::ptr::null_mut(),
     btn_install: std::ptr::null_mut(),
     btn_next: std::ptr::null_mut(),
     btn_cancel: std::ptr::null_mut(),
@@ -1182,6 +1205,15 @@ unsafe fn show_ctrl(hwnd_ctrl: *mut c_void, visible: bool) {
         unsafe {
             ShowWindow(hwnd_ctrl, if visible { 5 /* SW_SHOW */ } else { 0 /* SW_HIDE */ });
         }
+    }
+}
+
+unsafe fn set_lic_visible(visible: bool) {
+    unsafe {
+        show_ctrl(CTRLS.lbl_lic_prompt, visible);
+        show_ctrl(CTRLS.edt_lic_text, visible);
+        show_ctrl(CTRLS.rad_lic_accept, visible);
+        show_ctrl(CTRLS.rad_lic_decline, visible);
     }
 }
 
@@ -1231,16 +1263,41 @@ unsafe fn set_p3_finish_visible(visible: bool) {
 unsafe fn update_wizard_page(hwnd: *mut c_void) {
     unsafe {
         match CURRENT_PAGE {
+            WizardPage::License => {
+                set_lic_visible(true);
+                set_p1_install_visible(false);
+                set_p1_manage_visible(false);
+                set_p2_progress_visible(false);
+                set_p3_finish_visible(false);
+
+                show_ctrl(CTRLS.btn_back, true);
+                EnableWindow(CTRLS.btn_back, 0);
+                show_ctrl(CTRLS.btn_install, false);
+                show_ctrl(CTRLS.btn_next, true);
+
+                let accepted = SendMessageW(CTRLS.rad_lic_accept, BM_GETCHECK, 0, 0) == BST_CHECKED as isize;
+                EnableWindow(CTRLS.btn_next, if accepted { 1 } else { 0 });
+
+                show_ctrl(CTRLS.btn_cancel, true);
+                EnableWindow(CTRLS.btn_cancel, 1);
+                show_ctrl(CTRLS.btn_finish, false);
+            }
             WizardPage::Config => {
+                set_lic_visible(false);
                 if IS_CURRENTLY_INSTALLED {
                     set_p1_install_visible(false);
                     set_p1_manage_visible(true);
+                    show_ctrl(CTRLS.btn_back, false);
                     show_ctrl(CTRLS.btn_install, false);
                     show_ctrl(CTRLS.btn_next, true);
+                    EnableWindow(CTRLS.btn_next, 1);
                 } else {
                     set_p1_install_visible(true);
                     set_p1_manage_visible(false);
+                    show_ctrl(CTRLS.btn_back, true);
+                    EnableWindow(CTRLS.btn_back, 1);
                     show_ctrl(CTRLS.btn_install, true);
+                    EnableWindow(CTRLS.btn_install, 1);
                     show_ctrl(CTRLS.btn_next, false);
                 }
                 set_p2_progress_visible(false);
@@ -1251,11 +1308,14 @@ unsafe fn update_wizard_page(hwnd: *mut c_void) {
                 show_ctrl(CTRLS.btn_finish, false);
             }
             WizardPage::Progress => {
+                set_lic_visible(false);
                 set_p1_install_visible(false);
                 set_p1_manage_visible(false);
                 set_p2_progress_visible(true);
                 set_p3_finish_visible(false);
 
+                show_ctrl(CTRLS.btn_back, true);
+                EnableWindow(CTRLS.btn_back, 0);
                 show_ctrl(CTRLS.btn_install, false);
                 show_ctrl(CTRLS.btn_next, false);
                 show_ctrl(CTRLS.btn_cancel, true);
@@ -1265,11 +1325,13 @@ unsafe fn update_wizard_page(hwnd: *mut c_void) {
                 SendMessageW(CTRLS.bar_p2_progress, PBM_SETMARQUEE, 1, 30);
             }
             WizardPage::Finish => {
+                set_lic_visible(false);
                 set_p1_install_visible(false);
                 set_p1_manage_visible(false);
                 set_p2_progress_visible(false);
                 set_p3_finish_visible(true);
 
+                show_ctrl(CTRLS.btn_back, false);
                 show_ctrl(CTRLS.btn_install, false);
                 show_ctrl(CTRLS.btn_next, false);
                 show_ctrl(CTRLS.btn_cancel, false);
@@ -1331,7 +1393,16 @@ unsafe extern "system" fn installer_wnd_proc(
         match msg {
             WM_COMMAND => {
                 let id = wparam & 0xFFFF;
-                if id == ID_RADIO_REPAIR {
+                if id == ID_RAD_LIC_ACCEPT {
+                    EnableWindow(CTRLS.btn_next, 1);
+                } else if id == ID_RAD_LIC_DECLINE {
+                    EnableWindow(CTRLS.btn_next, 0);
+                } else if id == ID_BTN_BACK {
+                    if CURRENT_PAGE == WizardPage::Config && !IS_CURRENTLY_INSTALLED {
+                        CURRENT_PAGE = WizardPage::License;
+                        update_wizard_page(hwnd);
+                    }
+                } else if id == ID_RADIO_REPAIR {
                     ACTION_REPAIR = true;
                 } else if id == ID_RADIO_UNINSTALL {
                     ACTION_REPAIR = false;
@@ -1345,6 +1416,9 @@ unsafe extern "system" fn installer_wnd_proc(
                     if checked {
                         SendMessageW(CTRLS.chk_p1_modern, BM_SETCHECK, 0, 0);
                     }
+                } else if id == ID_BTN_NEXT && CURRENT_PAGE == WizardPage::License {
+                    CURRENT_PAGE = WizardPage::Config;
+                    update_wizard_page(hwnd);
                 } else if id == ID_BTN_INSTALL || id == ID_BTN_NEXT {
                     let opt_modern = SendMessageW(CTRLS.chk_p1_modern, BM_GETCHECK, 0, 0) != 0;
                     let opt_classic = SendMessageW(CTRLS.chk_p1_classic, BM_GETCHECK, 0, 0) != 0;
@@ -1440,7 +1514,7 @@ unsafe extern "system" fn installer_wnd_proc(
                 let hwnd_ctrl = lparam as *mut c_void;
                 SetBkMode(hdc_static, 1 /* TRANSPARENT */);
 
-                if hwnd_ctrl == CTRLS.edt_p1_target {
+                if hwnd_ctrl == CTRLS.edt_p1_target || hwnd_ctrl == CTRLS.edt_lic_text {
                     SetBkColor(hdc_static, 0x00FFFFFF);
                     return H_BRUSH_WHITE as isize;
                 }
@@ -1495,6 +1569,9 @@ unsafe extern "system" fn installer_wnd_proc(
 
                 // Header-Texte
                 let (header_title, header_sub) = match CURRENT_PAGE {
+                    WizardPage::License => {
+                        ("Lizenzvereinbarung", "Bitte lesen Sie die Lizenzbedingungen sorgfaeltig durch.")
+                    }
                     WizardPage::Config => {
                         if IS_CURRENTLY_INSTALLED {
                             ("WinShred Setup - Verwaltung", "Waehlen Sie eine Aktion fuer Ihre WinShred-Installation.")
@@ -1561,7 +1638,11 @@ unsafe extern "system" fn installer_wnd_proc(
 fn show_installer_wizard() {
     unsafe {
         IS_CURRENTLY_INSTALLED = is_installed();
-        CURRENT_PAGE = WizardPage::Config;
+        if IS_CURRENTLY_INSTALLED {
+            CURRENT_PAGE = WizardPage::Config;
+        } else {
+            CURRENT_PAGE = WizardPage::License;
+        }
         ACTION_REPAIR = true;
 
         // Common Controls initialisieren (Progress Bar, Buttons)
@@ -1639,6 +1720,30 @@ fn show_installer_wizard() {
         // ==========================================
         // Steuerelemente erzeugen
         // ==========================================
+
+        // --- Seite 0 (Lizenzvereinbarung) ---
+        CTRLS.lbl_lic_prompt = create_ctrl(
+            0, "STATIC", "Bitte lesen Sie die folgenden Lizenzbedingungen sorgfaeltig durch:",
+            WS_CHILD, 28, 76, 464, 18, hwnd, 0, H_FONT_REGULAR,
+        );
+        CTRLS.edt_lic_text = create_ctrl(
+            0, "EDIT", "",
+            WS_CHILD | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_TABSTOP,
+            28, 98, 464, 180, hwnd, 0, H_FONT_REGULAR,
+        );
+        let lic_crlf = LICENSE_TEXT.replace("\r\n", "\n").replace('\n', "\r\n");
+        let w_lic = to_wide_chars(&lic_crlf);
+        SendMessageW(CTRLS.edt_lic_text, 0x000C /* WM_SETTEXT */, 0, w_lic.as_ptr() as isize);
+
+        CTRLS.rad_lic_accept = create_ctrl(
+            0, "BUTTON", "Ich akzeptiere die Lizenzvereinbarung",
+            WS_CHILD | BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 28, 284, 464, 20, hwnd, ID_RAD_LIC_ACCEPT, H_FONT_REGULAR,
+        );
+        CTRLS.rad_lic_decline = create_ctrl(
+            0, "BUTTON", "Ich lehne die Lizenzvereinbarung ab",
+            WS_CHILD | BS_AUTORADIOBUTTON | WS_TABSTOP, 28, 306, 464, 20, hwnd, ID_RAD_LIC_DECLINE, H_FONT_REGULAR,
+        );
+        SendMessageW(CTRLS.rad_lic_decline, BM_SETCHECK, BST_CHECKED, 0);
 
         // --- Seite 1 (Neu-Installation) ---
         CTRLS.lbl_p1_title = create_ctrl(
@@ -1755,21 +1860,25 @@ fn show_installer_wizard() {
         );
 
         // --- Footer Buttons ---
+        CTRLS.btn_back = create_ctrl(
+            0, "BUTTON", "< Zurueck",
+            WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP, 200, 348, 88, 28, hwnd, ID_BTN_BACK, H_FONT_REGULAR,
+        );
         CTRLS.btn_install = create_ctrl(
             0, "BUTTON", "Installieren",
-            WS_CHILD | BS_DEFPUSHBUTTON | WS_TABSTOP, 290, 348, 105, 28, hwnd, ID_BTN_INSTALL, H_FONT_REGULAR,
+            WS_CHILD | BS_DEFPUSHBUTTON | WS_TABSTOP, 294, 348, 100, 28, hwnd, ID_BTN_INSTALL, H_FONT_REGULAR,
         );
         CTRLS.btn_next = create_ctrl(
             0, "BUTTON", "Weiter >",
-            WS_CHILD | BS_DEFPUSHBUTTON | WS_TABSTOP, 290, 348, 105, 28, hwnd, ID_BTN_NEXT, H_FONT_REGULAR,
+            WS_CHILD | BS_DEFPUSHBUTTON | WS_TABSTOP, 294, 348, 100, 28, hwnd, ID_BTN_NEXT, H_FONT_REGULAR,
         );
         CTRLS.btn_cancel = create_ctrl(
             0, "BUTTON", "Abbrechen",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP, 405, 348, 90, 28, hwnd, ID_BTN_CANCEL, H_FONT_REGULAR,
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP, 402, 348, 92, 28, hwnd, ID_BTN_CANCEL, H_FONT_REGULAR,
         );
         CTRLS.btn_finish = create_ctrl(
             0, "BUTTON", "Fertigstellen",
-            WS_CHILD | BS_DEFPUSHBUTTON | WS_TABSTOP, 390, 348, 105, 28, hwnd, ID_BTN_FINISH, H_FONT_REGULAR,
+            WS_CHILD | BS_DEFPUSHBUTTON | WS_TABSTOP, 394, 348, 100, 28, hwnd, ID_BTN_FINISH, H_FONT_REGULAR,
         );
 
         // Erste Seite initialisieren

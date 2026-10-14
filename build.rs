@@ -5,6 +5,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../winshred_shell/target/release/winshred_shell.dll");
     println!("cargo:rerun-if-changed=packaging/winshred.msix");
     println!("cargo:rerun-if-changed=packaging/winshred.cer");
+    println!("cargo:rerun-if-changed=LICENSE");
 
     let rc_candidates = [
         r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\rc.exe",
