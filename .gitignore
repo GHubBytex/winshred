@@ -5,6 +5,8 @@ target/
 **/target/
 Cargo.lock.bak
 **/*.rs.bk
+*.msix
+packaging/*.msix
 
 # ==========================================
 # Windows Binaries & Kompilate
