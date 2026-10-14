@@ -10,15 +10,23 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 
 Write-Host "Entferne WinShred aus dem Kontextmenue..." -ForegroundColor Yellow
 
-# 1. Registry Einträge löschen
-Remove-Item -Path "HKCU:\Software\Classes\*\shell\WinShred" -Recurse -Force
-Remove-Item -Path "HKCU:\Software\Classes\Directory\shell\WinShred" -Recurse -Force
+# 1. Registry Einträge löschen (direkt via reg.exe ohne Wildcard-Hang)
+& reg delete "HKLM\Software\Classes\*\shell\WinShred" /f 2>$null
+& reg delete "HKLM\Software\Classes\Directory\shell\WinShred" /f 2>$null
+& reg delete "HKCU\Software\Classes\*\shell\WinShred" /f 2>$null
+& reg delete "HKCU\Software\Classes\Directory\shell\WinShred" /f 2>$null
+& reg delete "HKCR\*\shell\WinShred" /f 2>$null
+& reg delete "HKCR\Directory\shell\WinShred" /f 2>$null
 
 # 2. SendTo Verknüpfung löschen
 $sendToShortcut = [System.IO.Path]::Combine($env:APPDATA, 'Microsoft\Windows\SendTo\WinShred (Sicher vernichten).lnk')
 if (Test-Path $sendToShortcut) {
     Remove-Item -Path $sendToShortcut -Force
 }
+
+# 3. Explorer neu starten
+Stop-Process -Name explorer -Force
+Start-Process explorer
 
 Write-Host "WinShred wurde vollstaendig aus dem Kontextmenue entfernt." -ForegroundColor Green
 Start-Sleep -Seconds 2
