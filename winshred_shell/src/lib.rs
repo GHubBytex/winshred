@@ -44,11 +44,25 @@ pub const CLSID_WINSHREDCOMMAND: GUID = GUID {
 pub type HRESULT = i32;
 pub const S_OK: HRESULT = 0;
 pub const S_FALSE: HRESULT = 1;
-pub const E_NOINTERFACE: HRESULT = -2147467262; // 0x80004002
-pub const E_POINTER: HRESULT = -2147467261;     // 0x80004003
-pub const E_FAIL: HRESULT = -2147467259;        // 0x80004005
-pub const E_NOTIMPL: HRESULT = -2147467263;     // 0x80004001
-pub const CLASS_E_NOAGGREGATION: HRESULT = -2147221232; // 0x80040110
+pub const E_NOINTERFACE: HRESULT = -2147467262;
+pub const E_POINTER: HRESULT = -2147467261;
+pub const E_FAIL: HRESULT = -2147467259;
+pub const E_NOTIMPL: HRESULT = -2147467263;
+pub const CLASS_E_NOAGGREGATION: HRESULT = -2147221232;
+
+static mut HMODULE_INSTANCE: *mut c_void = std::ptr::null_mut();
+
+#[no_mangle]
+pub unsafe extern "system" fn DllMain(
+    h_inst: *mut c_void,
+    reason: u32,
+    _reserved: *mut c_void,
+) -> i32 {
+    if reason == 1 { // DLL_PROCESS_ATTACH
+        HMODULE_INSTANCE = h_inst;
+    }
+    1
+}
 
 #[link(name = "ole32")]
 unsafe extern "system" {
@@ -317,17 +331,18 @@ unsafe extern "system" fn cmd_invoke(
         }
     }
 
-    // Ermittle den Pfad zur winshred.exe (liegt neben dieser DLL)
-    let mut exe_path = PathBuf::from("A:\\Code\\01 TEMP\\REA\\winshred\\target\\release\\winshred.exe");
-    let mut mod_buf = [0u16; 1024];
-    let len = GetModuleFileNameW(std::ptr::null_mut(), mod_buf.as_mut_ptr(), 1024);
-    if len > 0 {
-        let dll_path = String::from_utf16_lossy(&mod_buf[..len as usize]);
-        let dir = PathBuf::from(dll_path).parent().map(|p| p.to_path_buf());
-        if let Some(d) = dir {
-            let candidate = d.join("winshred.exe");
-            if candidate.exists() {
-                exe_path = candidate;
+    // Ermittle den Pfad zur winshred.exe (primär im Installationsordner oder neben dieser DLL)
+    let mut exe_path = PathBuf::from("C:\\Program Files\\WinShred\\winshred.exe");
+    if !exe_path.exists() {
+        let mut mod_buf = [0u16; 1024];
+        let len = GetModuleFileNameW(HMODULE_INSTANCE, mod_buf.as_mut_ptr(), 1024);
+        if len > 0 {
+            let dll_path = String::from_utf16_lossy(&mod_buf[..len as usize]);
+            if let Some(d) = PathBuf::from(dll_path).parent() {
+                let candidate = d.join("winshred.exe");
+                if candidate.exists() {
+                    exe_path = candidate;
+                }
             }
         }
     }

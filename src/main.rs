@@ -7,7 +7,18 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
+// ==========================================
+// Eingebettete Ressourcen für All-in-One Setup
+// ==========================================
+const SHELL_DLL_BYTES: &[u8] = include_bytes!("../winshred_shell/target/release/winshred_shell.dll");
+const MSIX_BYTES: &[u8] = include_bytes!("../winshred.msix");
+const CER_BYTES: &[u8] = include_bytes!("../winshred.cer");
+
+// ==========================================
+// Win32 API Bindings
+// ==========================================
 #[link(name = "user32")]
 unsafe extern "system" {
     fn MessageBoxW(
@@ -16,6 +27,19 @@ unsafe extern "system" {
         lp_caption: *const u16,
         u_type: u32,
     ) -> i32;
+}
+
+#[link(name = "shell32")]
+unsafe extern "system" {
+    fn IsUserAnAdmin() -> i32;
+    fn ShellExecuteW(
+        hwnd: *mut std::ffi::c_void,
+        lp_operation: *const u16,
+        lp_file: *const u16,
+        lp_parameters: *const u16,
+        lp_directory: *const u16,
+        n_show_cmd: i32,
+    ) -> isize;
 }
 
 #[link(name = "bcrypt")]
@@ -75,14 +99,17 @@ unsafe extern "system" {
 }
 
 const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x00000002;
+const MB_OK: u32 = 0x00000000;
 const MB_YESNO: u32 = 0x00000004;
+const MB_YESNOCANCEL: u32 = 0x00000003;
 const MB_ICONWARNING: u32 = 0x00000030;
+const MB_ICONQUESTION: u32 = 0x00000020;
 const MB_DEFBUTTON2: u32 = 0x00000100;
 const MB_ICONINFORMATION: u32 = 0x00000040;
 const MB_ICONERROR: u32 = 0x00000010;
 const IDYES: i32 = 6;
+const IDNO: i32 = 7;
 
-// FSCTL_FILE_LEVEL_TRIM = CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 130, METHOD_BUFFERED, FILE_WRITE_DATA)
 const FSCTL_FILE_LEVEL_TRIM: u32 = 0x00098208;
 
 fn to_wide_chars(s: &str) -> Vec<u16> {
@@ -106,6 +133,24 @@ fn show_message_box(text: &str, title: &str, flags: u32) -> i32 {
     }
 }
 
+fn elevate_relaunch(params: &str) {
+    if let Ok(exe) = env::current_exe() {
+        let op = to_wide_chars("runas");
+        let file = to_wide_chars(&exe.to_string_lossy());
+        let wide_params = to_wide_chars(params);
+        unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                op.as_ptr(),
+                file.as_ptr(),
+                wide_params.as_ptr(),
+                std::ptr::null(),
+                1, // SW_SHOWNORMAL
+            );
+        }
+    }
+}
+
 fn fill_random_bytes(buf: &mut [u8]) -> io::Result<()> {
     let status = unsafe {
         BCryptGenRandom(
@@ -122,7 +167,10 @@ fn fill_random_bytes(buf: &mut [u8]) -> io::Result<()> {
     }
 }
 
-/// Ermittelt die Clustergröße des Dateisystems für Cluster-Slack-Berechnungen.
+// ==========================================
+// Shredder Logik (Slack, ADS, TRIM, MFT-Wipe)
+// ==========================================
+
 fn get_cluster_size(path: &Path) -> u64 {
     let mut sectors_per_cluster: u32 = 0;
     let mut bytes_per_sector: u32 = 0;
@@ -163,7 +211,6 @@ fn get_cluster_size(path: &Path) -> u64 {
     }
 }
 
-/// Sendet einen Deallocate/TRIM-Befehl an den Datenträger-Treiber (SSD / NVMe).
 fn trim_file(file: &fs::File, len: u64) {
     if len == 0 {
         return;
@@ -216,8 +263,6 @@ fn trim_file(file: &fs::File, len: u64) {
     }
 }
 
-/// Überschreibt den Inhalt eines geöffneten Datei- oder Stream-Handles mit 3 Durchgängen,
-/// flusht Caches, sendet SSD-TRIM und schneidet die Größe auf 0 ab.
 fn wipe_open_file(file: &mut fs::File, wipe_len: u64) -> io::Result<()> {
     if wipe_len == 0 {
         return Ok(());
@@ -269,7 +314,6 @@ fn wipe_open_file(file: &mut fs::File, wipe_len: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// Sucht alle Alternate Data Streams (ADS) einer Datei.
 fn get_file_streams(path: &Path) -> Vec<String> {
     let mut streams = Vec::new();
     let wide_path = path_to_wide(path);
@@ -278,7 +322,7 @@ fn get_file_streams(path: &Path) -> Vec<String> {
     let handle = unsafe {
         FindFirstStreamW(
             wide_path.as_ptr(),
-            0, // FindStreamInfoStandard
+            0,
             &mut stream_data as *mut _ as *mut std::ffi::c_void,
             0,
         )
@@ -296,7 +340,6 @@ fn get_file_streams(path: &Path) -> Vec<String> {
             .unwrap_or(stream_data.c_stream_name.len());
         let stream_name = String::from_utf16_lossy(&stream_data.c_stream_name[..name_len]);
 
-        // "::$DATA" ist der Hauptstrom; wir interessieren uns hier für alle alternativen Ströme
         if stream_name != "::$DATA" && !stream_name.is_empty() {
             streams.push(stream_name);
         }
@@ -319,7 +362,6 @@ fn get_file_streams(path: &Path) -> Vec<String> {
     streams
 }
 
-/// Überschreibt und löscht alle Alternate Data Streams (ADS).
 fn shred_alternate_streams(path: &Path) -> io::Result<()> {
     let streams = get_file_streams(path);
     for stream_name in streams {
@@ -334,7 +376,6 @@ fn shred_alternate_streams(path: &Path) -> io::Result<()> {
             }
         }
 
-        // Stream über DeleteFileW entfernen
         let wide_stream_path = path_to_wide(&stream_path);
         unsafe {
             DeleteFileW(wide_stream_path.as_ptr());
@@ -343,8 +384,6 @@ fn shred_alternate_streams(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Anonymisiert Dateinamen / Ordnernamen durch mehrfaches Umbenennen vor dem endgültigen Löschen.
-/// Dies überschreibt die Namensattribute ($FILE_NAME bzw. $INDEX_ROOT) im NTFS MFT-Record.
 fn secure_multi_rename(path: &Path) -> io::Result<PathBuf> {
     let parent = match path.parent() {
         Some(p) => p,
@@ -353,7 +392,6 @@ fn secure_multi_rename(path: &Path) -> io::Result<PathBuf> {
 
     let mut current_path = path.to_path_buf();
 
-    // Schreibschutz vor dem Umbenennen aufheben
     if let Ok(meta) = fs::metadata(&current_path) {
         let mut perms = meta.permissions();
         if perms.readonly() {
@@ -365,7 +403,6 @@ fn secure_multi_rename(path: &Path) -> io::Result<PathBuf> {
     let mut rand_bytes = [0u8; 12];
     let _ = fill_random_bytes(&mut rand_bytes);
 
-    // Pass 1: Einheitliche Füllzeichen 'a'
     let pass1_name = format!(
         "shred_aaaa_{:02x}{:02x}{:02x}{:02x}.tmp",
         rand_bytes[0], rand_bytes[1], rand_bytes[2], rand_bytes[3]
@@ -375,7 +412,6 @@ fn secure_multi_rename(path: &Path) -> io::Result<PathBuf> {
         current_path = p1;
     }
 
-    // Pass 2: Einheitliche Füllzeichen '0'
     let pass2_name = format!(
         "shred_0000_{:02x}{:02x}{:02x}{:02x}.tmp",
         rand_bytes[4], rand_bytes[5], rand_bytes[6], rand_bytes[7]
@@ -385,7 +421,6 @@ fn secure_multi_rename(path: &Path) -> io::Result<PathBuf> {
         current_path = p2;
     }
 
-    // Pass 3: Reiner kryptografischer Zufallsname
     let pass3_name = format!(
         "shred_rand_{:02x}{:02x}{:02x}{:02x}.tmp",
         rand_bytes[8], rand_bytes[9], rand_bytes[10], rand_bytes[11]
@@ -410,11 +445,8 @@ fn clear_readonly(path: &Path) {
 
 fn shred_file(path: &Path) -> io::Result<()> {
     clear_readonly(path);
-
-    // 1. Alternate Data Streams (ADS) enumerieren und vernichten
     let _ = shred_alternate_streams(path);
 
-    // 2. Hauptdatei öffnen
     let mut file = OpenOptions::new()
         .write(true)
         .read(true)
@@ -422,7 +454,6 @@ fn shred_file(path: &Path) -> io::Result<()> {
 
     let len = file.metadata()?.len();
     if len > 0 {
-        // Cluster-Slack berücksichtigen: Überschreiben bis zur Cluster-Grenze
         let cluster_size = get_cluster_size(path);
         let remainder = len % cluster_size;
         let wipe_len = if remainder != 0 {
@@ -436,7 +467,6 @@ fn shred_file(path: &Path) -> io::Result<()> {
 
     drop(file);
 
-    // 3. Multi-Pass Rename zur MFT-Verschleierung
     let final_path = secure_multi_rename(path)?;
     fs::remove_file(final_path)
 }
@@ -449,7 +479,6 @@ fn shred_recursive(path: &Path) -> io::Result<()> {
             let entry = entry?;
             shred_recursive(&entry.path())?;
         }
-        // Ordner vor dem Löschen mehrfach anonymisieren
         let final_dir_path = secure_multi_rename(path)?;
         fs::remove_dir(final_dir_path)?;
     } else if path.is_file() {
@@ -458,21 +487,182 @@ fn shred_recursive(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
+// ==========================================
+// All-in-One Installer / Deinstaller Logik
+// ==========================================
 
-    if args.is_empty() {
+fn is_installed() -> bool {
+    let app_path = PathBuf::from("C:\\Program Files\\WinShred\\winshred.exe");
+    app_path.exists()
+}
+
+fn run_install() {
+    let is_admin = unsafe { IsUserAnAdmin() } != 0;
+    if !is_admin {
+        elevate_relaunch("--install");
+        return;
+    }
+
+    let install_dir = PathBuf::from("C:\\Program Files\\WinShred");
+    if let Err(e) = fs::create_dir_all(&install_dir) {
         show_message_box(
-            "WinShred - Sicheres Vernichten von Dateien & Ordnern\n\n\
-            Verwendung:\n\
-            1. Rechtsklick auf eine Datei oder einen Ordner -> 'Mit WinShred sicher vernichten'\n\
-            2. Oder Datei direkt auf diese Anwendung ziehen.",
-            "WinShred",
-            MB_ICONINFORMATION,
+            &format!("Fehler beim Erstellen des Installationsordners:\n{}", e),
+            "WinShred Setup - Fehler",
+            MB_ICONERROR,
         );
         return;
     }
 
+    // 1. Eigene EXE nach Program Files kopieren
+    if let Ok(current_exe) = env::current_exe() {
+        let target_exe = install_dir.join("winshred.exe");
+        if current_exe != target_exe {
+            let _ = fs::copy(&current_exe, &target_exe);
+        }
+    }
+
+    // 2. Eingebettete Shell-DLL, MSIX und Zertifikat ablegen
+    let dll_path = install_dir.join("winshred_shell.dll");
+    let msix_path = install_dir.join("winshred.msix");
+    let cer_path = install_dir.join("winshred.cer");
+
+    let _ = fs::write(&dll_path, SHELL_DLL_BYTES);
+    let _ = fs::write(&msix_path, MSIX_BYTES);
+    let _ = fs::write(&cer_path, CER_BYTES);
+
+    // 3. PowerShell-Setup für Zertifikat + AppX + Shell + SendTo
+    let ps_command = format!(
+        "Import-Certificate -FilePath '{cer}' -CertStoreLocation 'Cert:\\LocalMachine\\TrustedPeople' | Out-Null; \
+        Get-AppxPackage -Name 'WinShred.ShellExtension' -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue; \
+        Add-AppxPackage -Path '{msix}' -ExternalLocation '{inst}'; \
+        $wsh = New-Object -ComObject WScript.Shell; \
+        $s = $wsh.CreateShortcut(\"$env:APPDATA\\Microsoft\\Windows\\SendTo\\WinShred (Sicher vernichten).lnk\"); \
+        $s.TargetPath = '{inst}\\winshred.exe'; \
+        $s.IconLocation = '$env:SystemRoot\\System32\\imageres.dll,5307'; \
+        $s.Save(); \
+        Stop-Process -Name explorer -Force; Start-Process explorer",
+        cer = cer_path.to_string_lossy(),
+        msix = msix_path.to_string_lossy(),
+        inst = install_dir.to_string_lossy()
+    );
+
+    let status = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_command])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            show_message_box(
+                "WinShred wurde erfolgreich installiert!\n\n\
+                'Mit WinShred sicher vernichten' ist ab sofort direkt im modernen Windows 11 Kontextmenü aktiv.",
+                "WinShred Setup",
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+        _ => {
+            show_message_box(
+                "Installation abgeschlossen. Bitte starten Sie ggf. den Explorer neu.",
+                "WinShred Setup",
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+    }
+}
+
+fn run_uninstall() {
+    let is_admin = unsafe { IsUserAnAdmin() } != 0;
+    if !is_admin {
+        elevate_relaunch("--uninstall");
+        return;
+    }
+
+    let ps_command = "\
+        Get-AppxPackage -Name 'WinShred.ShellExtension' -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue; \
+        $cert = Get-ChildItem Cert:\\LocalMachine\\TrustedPeople | Where-Object { $_.Subject -eq 'CN=WinShred' }; \
+        if ($cert) { Remove-Item ('Cert:\\LocalMachine\\TrustedPeople\\' + $cert.Thumbprint) -Force }; \
+        Remove-Item -Path 'HKLM:\\SOFTWARE\\Classes\\*\\shell\\WinShred' -Recurse -Force -ErrorAction SilentlyContinue; \
+        Remove-Item -Path 'HKLM:\\SOFTWARE\\Classes\\Directory\\shell\\WinShred' -Recurse -Force -ErrorAction SilentlyContinue; \
+        Remove-Item -Path 'HKCU:\\Software\\Classes\\*\\shell\\WinShred' -Recurse -Force -ErrorAction SilentlyContinue; \
+        Remove-Item -Path 'HKCU:\\Software\\Classes\\Directory\\shell\\WinShred' -Recurse -Force -ErrorAction SilentlyContinue; \
+        Remove-Item \"$env:APPDATA\\Microsoft\\Windows\\SendTo\\WinShred (Sicher vernichten).lnk\" -Force -ErrorAction SilentlyContinue; \
+        Stop-Process -Name explorer -Force; Start-Process explorer";
+
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_command])
+        .status();
+
+    // Begleitdateien entfernen
+    let install_dir = PathBuf::from("C:\\Program Files\\WinShred");
+    let _ = fs::remove_file(install_dir.join("winshred_shell.dll"));
+    let _ = fs::remove_file(install_dir.join("winshred.msix"));
+    let _ = fs::remove_file(install_dir.join("winshred.cer"));
+
+    // Falls die laufende EXE nicht in C:\Program Files liegt, können wir den Ordner komplett leeren
+    if let Ok(current_exe) = env::current_exe() {
+        if !current_exe.starts_with(&install_dir) {
+            let _ = fs::remove_file(install_dir.join("winshred.exe"));
+            let _ = fs::remove_dir(&install_dir);
+        }
+    }
+
+    show_message_box(
+        "WinShred wurde erfolgreich aus dem Kontextmenü entfernt und deinstalliert.",
+        "WinShred Setup",
+        MB_OK | MB_ICONINFORMATION,
+    );
+}
+
+// ==========================================
+// Entry Point (CLI / GUI / Kontextmenü)
+// ==========================================
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    // 1. Spezial-Flags für stille oder direkte Installation / Deinstallation
+    if args.iter().any(|a| a == "--install" || a == "-i") {
+        run_install();
+        return;
+    }
+    if args.iter().any(|a| a == "--uninstall" || a == "-u") {
+        run_uninstall();
+        return;
+    }
+
+    // 2. Ohne Parameter gestartet (z.B. Doppelklick auf die EXE) -> Setup / Deinstallation anbieten
+    if args.is_empty() {
+        if !is_installed() {
+            let res = show_message_box(
+                "Willkommen bei WinShred!\n\n\
+                WinShred ist aktuell noch nicht in Ihrem System installiert.\n\n\
+                Möchten Sie WinShred jetzt im modernen Windows 11 Kontextmenü installieren?\n\n\
+                [Ja] = Jetzt installieren\n\
+                [Nein] = Abbrechen",
+                "WinShred - All-in-One Setup",
+                MB_YESNO | MB_ICONQUESTION,
+            );
+            if res == IDYES {
+                run_install();
+            }
+        } else {
+            let res = show_message_box(
+                "WinShred ist aktuell auf Ihrem Computer installiert und aktiv.\n\n\
+                Was möchten Sie tun?\n\n\
+                [Ja] = WinShred deinstallieren (aus dem Kontextmenü entfernen)\n\
+                [Nein] = WinShred reparieren / neu installieren\n\
+                [Abbrechen] = Beenden",
+                "WinShred - All-in-One Setup",
+                MB_YESNOCANCEL | MB_ICONQUESTION,
+            );
+            if res == IDYES {
+                run_uninstall();
+            } else if res == IDNO {
+                run_install();
+            }
+        }
+        return;
+    }
+
+    // 3. Mit Parametern gestartet (z.B. Rechtsklick im Kontextmenü oder Drag & Drop) -> Shredder-Modus
     let mut paths_to_shred: Vec<PathBuf> = Vec::new();
     let mut auto_confirm = false;
 
@@ -496,7 +686,7 @@ fn main() {
         return;
     }
 
-    // Sicherheitsabfrage
+    // Sicherheitsabfrage vor dem Vernichten
     if !auto_confirm {
         let count = paths_to_shred.len();
         let prompt_text = if count == 1 {
@@ -510,9 +700,9 @@ fn main() {
                 "Möchten Sie {} '{}' wirklich unwiderruflich vernichten?\n\n\
                 SICHERHEITS-FEATURES:\n\
                 - 3-faches Überschreiben (0x00, 0xFF, Krypto-Zufall)\n\
-                - Cluster-Slack & Alternate Data Streams (ADS) werden bereinigt\n\
-                - SSD/NVMe TRIM Deallocate-Signale werden gesendet\n\
-                - Mehrfache Namens-Anonymisierung im Dateisystem\n\n\
+                - Cluster-Slack & Alternate Data Streams (ADS) Bereinigung\n\
+                - SSD/NVMe TRIM Deallocate-Signal zur Controller-Tilgung\n\
+                - Mehrfache Namens-Anonymisierung im NTFS MFT-Dateisystem\n\n\
                 WARNUNG: Dieser Vorgang ist unumkehrbar!",
                 typ, name
             )
@@ -535,7 +725,7 @@ fn main() {
         }
     }
 
-    // Durchführen
+    // Ausführung
     let mut errors = 0;
     for path in &paths_to_shred {
         if let Err(e) = shred_recursive(path) {
@@ -572,19 +762,13 @@ mod tests {
         let test_file = temp_dir.join("test_secret.txt");
         fs::write(&test_file, b"Hauptinhalt der Testdatei").unwrap();
 
-        // Alternate Data Stream anlegen
         let ads_path_str = format!("{}:ads_secret:$DATA", test_file.to_string_lossy());
         if let Ok(mut ads_file) = OpenOptions::new().write(true).create(true).open(&ads_path_str) {
             ads_file.write_all(b"Geheimer Alternate Data Stream").unwrap();
         }
 
-        // Prüfen, dass Datei existiert
         assert!(test_file.exists());
-
-        // Shreddern
         shred_file(&test_file).unwrap();
-
-        // Prüfen, dass weder Datei noch ADS mehr existieren
         assert!(!test_file.exists());
 
         let _ = fs::remove_dir_all(&temp_dir);
@@ -602,9 +786,7 @@ mod tests {
         fs::write(&file2, b"Test 2").unwrap();
 
         assert!(temp_dir.exists());
-
         shred_recursive(&temp_dir).unwrap();
-
         assert!(!temp_dir.exists());
     }
 }
