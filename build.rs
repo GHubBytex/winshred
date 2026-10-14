@@ -2,6 +2,9 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/winshred.ico");
     println!("cargo:rerun-if-changed=resources/app.rc");
     println!("cargo:rerun-if-changed=resources/app.manifest");
+    println!("cargo:rerun-if-changed=../winshred_shell/target/release/winshred_shell.dll");
+    println!("cargo:rerun-if-changed=packaging/winshred.msix");
+    println!("cargo:rerun-if-changed=packaging/winshred.cer");
 
     let rc_candidates = [
         r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\rc.exe",

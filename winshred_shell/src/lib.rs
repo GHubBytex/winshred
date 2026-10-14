@@ -232,7 +232,24 @@ unsafe extern "system" fn cmd_get_icon(
     if PathBuf::from(icon_path).exists() {
         *ppsz_icon = alloc_co_string(icon_path);
     } else {
-        *ppsz_icon = alloc_co_string("imageres.dll,-5308");
+        let mut found_path: Option<PathBuf> = None;
+        let mut mod_buf = [0u16; 1024];
+        let len = GetModuleFileNameW(HMODULE_INSTANCE, mod_buf.as_mut_ptr(), 1024);
+        if len > 0 {
+            let dll_path = String::from_utf16_lossy(&mod_buf[..len as usize]);
+            if let Some(d) = PathBuf::from(dll_path).parent() {
+                let candidate = d.join("winshred.ico");
+                if candidate.exists() {
+                    found_path = Some(candidate);
+                }
+            }
+        }
+
+        if let Some(p) = found_path {
+            *ppsz_icon = alloc_co_string(&p.to_string_lossy());
+        } else {
+            *ppsz_icon = alloc_co_string("imageres.dll,-5308");
+        }
     }
     if (*ppsz_icon).is_null() {
         E_FAIL
@@ -336,6 +353,11 @@ unsafe extern "system" fn cmd_invoke(
         }
     }
 
+    // Verhindere Start ohne Argumente (wuerde sonst Setup-Assistent starten!)
+    if paths.is_empty() {
+        return S_OK;
+    }
+
     // Ermittle den Pfad zur winshred.exe (primär im Installationsordner oder neben dieser DLL)
     let mut exe_path = PathBuf::from("C:\\Program Files\\WinShred\\winshred.exe");
     if !exe_path.exists() {
@@ -352,11 +374,32 @@ unsafe extern "system" fn cmd_invoke(
         }
     }
 
-    let mut cmd = Command::new(&exe_path);
+    // Windows Command-Line Limit (32.767 Zeichen) absichern durch Batching
+    let mut current_batch: Vec<&str> = Vec::new();
+    let mut current_len: usize = exe_path.to_string_lossy().len() + 10;
+
     for p in &paths {
-        cmd.arg(p);
+        let p_len = p.len() + 3;
+        if current_len + p_len > 30000 && !current_batch.is_empty() {
+            let mut cmd = Command::new(&exe_path);
+            for arg in &current_batch {
+                cmd.arg(arg);
+            }
+            let _ = cmd.spawn();
+            current_batch.clear();
+            current_len = exe_path.to_string_lossy().len() + 10;
+        }
+        current_batch.push(p);
+        current_len += p_len;
     }
-    let _ = cmd.spawn();
+
+    if !current_batch.is_empty() {
+        let mut cmd = Command::new(&exe_path);
+        for arg in &current_batch {
+            cmd.arg(arg);
+        }
+        let _ = cmd.spawn();
+    }
 
     S_OK
 }
