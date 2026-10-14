@@ -1,8 +1,40 @@
+# ==========================================
+# Rust / Cargo Build-Artefakte
+# ==========================================
 target/
 **/target/
+Cargo.lock.bak
+**/*.rs.bk
+
+# ==========================================
+# Windows Binaries & Kompilate
+# ==========================================
+*.exe
+winshred.exe
+*.dll
 *.pdb
 *.obj
 *.res
-*.log
+*.lib
+*.exp
+*.ilk
+
+# ==========================================
+# IDEs & Editoren
+# ==========================================
 .vscode/
 .idea/
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# ==========================================
+# Logs & Temporäre Dateien
+# ==========================================
+*.log
+*.tmp
+*.bak
+Thumbs.db
+Desktop.ini
