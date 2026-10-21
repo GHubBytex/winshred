@@ -40,3 +40,13 @@ winshred.exe
 *.bak
 Thumbs.db
 Desktop.ini
+
+# ==========================================
+# Archive & Zertifikate
+# ==========================================
+*.zip
+*.7z
+*.rar
+*.cer
+*.pfx
+*.pvk
