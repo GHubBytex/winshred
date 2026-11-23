@@ -18,19 +18,12 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-:: 2. Suche Windows SDK Tools (MakeAppx, SignTool, RC)
+:: 2. Suche Windows SDK Tools (MakeAppx, SignTool, RC) dynamisch (neueste Version)
 set "SDK_BIN="
-if exist "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\makeappx.exe" (
-    set "SDK_BIN=C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64"
-    goto :found_sdk
-)
-if exist "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe" (
-    set "SDK_BIN=C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64"
-    goto :found_sdk
-)
-if exist "C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\makeappx.exe" (
-    set "SDK_BIN=C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64"
-    goto :found_sdk
+for /d %%D in ("C:\Program Files (x86)\Windows Kits\10\bin\10.*") do (
+    if exist "%%D\x64\makeappx.exe" if exist "%%D\x64\signtool.exe" (
+        set "SDK_BIN=%%D\x64"
+    )
 )
 
 :found_sdk

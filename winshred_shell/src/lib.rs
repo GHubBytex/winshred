@@ -400,6 +400,7 @@ unsafe extern "system" fn cmd_invoke(
     const MAX_CMDLINE_UTF16: usize = 30000;
     if estimate_utf16_cmdline_len(&exe_path, &paths) <= MAX_CMDLINE_UTF16 {
         let mut cmd = Command::new(&exe_path);
+        cmd.arg("--");
         for p in &paths {
             cmd.arg(p);
         }

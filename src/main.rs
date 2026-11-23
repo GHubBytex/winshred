@@ -557,17 +557,23 @@ fn to_wide_chars(s: &str) -> Vec<u16> {
 fn path_to_wide(path: &Path) -> Vec<u16> {
     let raw: Vec<u16> = path.as_os_str().encode_wide().collect();
     let s = path.to_string_lossy();
-    if raw.len() >= 240 && !s.starts_with(r"\\?\") && !s.starts_with(r"\\.\") {
+    if s.starts_with(r"\\?\") || s.starts_with(r"\\.\") {
+        return raw.into_iter().chain(Some(0)).collect();
+    }
+    if raw.len() >= 240 || path.is_relative() {
         let abs = resolve_absolute_no_symlink(path);
-        let abs_s = abs.to_string_lossy();
-        let verbatim = if abs_s.starts_with(r"\\?\") || abs_s.starts_with(r"\\.\") {
-            abs_s.into_owned()
-        } else if let Some(rest) = abs_s.strip_prefix(r"\\") {
-            format!(r"\\?\UNC\{}", rest)
-        } else {
-            format!(r"\\?\{}", abs_s)
-        };
-        return OsStr::new(&verbatim).encode_wide().chain(Some(0)).collect();
+        let abs_wide_len = abs.as_os_str().encode_wide().count();
+        if raw.len() >= 240 || abs_wide_len >= 240 {
+            let abs_s = abs.to_string_lossy();
+            let verbatim = if abs_s.starts_with(r"\\?\") || abs_s.starts_with(r"\\.\") {
+                abs_s.into_owned()
+            } else if let Some(rest) = abs_s.strip_prefix(r"\\") {
+                format!(r"\\?\UNC\{}", rest)
+            } else {
+                format!(r"\\?\{}", abs_s)
+            };
+            return OsStr::new(&verbatim).encode_wide().chain(Some(0)).collect();
+        }
     }
     raw.into_iter().chain(Some(0)).collect()
 }
@@ -2529,8 +2535,8 @@ fn run_install_backend(opt_modern: bool, opt_classic: bool, opt_sendto: bool) ->
         // 2. Eigene EXE nach Program Files kopieren (mit kurzem Retry falls Ziel noch freigegeben wird)
         let target_exe = install_dir.join("winshred.exe");
         if let Ok(current_exe) = env::current_exe() {
-            let same_exe = current_exe.to_string_lossy().to_ascii_lowercase()
-                == target_exe.to_string_lossy().to_ascii_lowercase();
+            let same_exe = normalize_win_path_for_compare(&current_exe, true)
+                == normalize_win_path_for_compare(&target_exe, true);
             if !same_exe {
                 let mut copy_err = None;
                 for _ in 0..5 {
@@ -5354,27 +5360,91 @@ fn read_paths_from_filelist(list_path: &Path, delete_after: bool) -> Result<Vec<
 
 static ELEVATE_LIST_SEQ: AtomicU32 = AtomicU32::new(1);
 
+fn deduplicate_and_prune_nested_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    struct Entry {
+        path: PathBuf,
+        norm: String,
+        is_real_dir: bool,
+    }
+
+    let entries: Vec<Entry> = paths
+        .into_iter()
+        .map(|path| {
+            let norm = normalize_win_path_for_compare(&path, false);
+            let is_real_dir = fs::symlink_metadata(&path)
+                .map(|m| !m.file_type().is_symlink() && m.is_dir())
+                .unwrap_or(false);
+            Entry {
+                path,
+                norm,
+                is_real_dir,
+            }
+        })
+        .collect();
+
+    let dir_norms: Vec<String> = entries
+        .iter()
+        .filter(|e| e.is_real_dir && !e.norm.is_empty())
+        .map(|e| e.norm.clone())
+        .collect();
+
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for entry in entries {
+        if entry.norm.is_empty() {
+            continue;
+        }
+        let covered_by_parent_dir = dir_norms
+            .iter()
+            .any(|d| d != &entry.norm && is_strict_subpath(&entry.norm, d));
+        if covered_by_parent_dir {
+            continue;
+        }
+        if seen.insert(entry.norm) {
+            result.push(entry.path);
+        }
+    }
+    result
+}
+
+fn build_elevated_relaunch_parts(
+    valid_paths: &[PathBuf],
+    custom_passes: Option<usize>,
+    skip_checked: bool,
+) -> (Vec<String>, Vec<PathBuf>, Vec<String>) {
+    let mut base_parts = vec![
+        String::from("--admin"),
+        String::from("--elevated-confirmed"),
+    ];
+    if skip_checked {
+        base_parts.push(String::from("--skip-prompt-checked"));
+    }
+    if let Some(p_count) = custom_passes {
+        base_parts.push(String::from("--passes"));
+        base_parts.push(p_count.to_string());
+    }
+
+    let abs_paths: Vec<PathBuf> = valid_paths
+        .iter()
+        .map(|p| resolve_absolute_no_symlink(p))
+        .collect();
+
+    let mut direct_parts = base_parts.clone();
+    direct_parts.push(String::from("--"));
+    for p in &abs_paths {
+        direct_parts.push(quote_windows_cli_arg(&p.to_string_lossy()));
+    }
+
+    (base_parts, abs_paths, direct_parts)
+}
+
 fn relaunch_elevated_with_paths(
     valid_paths: &[PathBuf],
     custom_passes: Option<usize>,
     skip_checked: bool,
 ) {
-    let mut parts = vec![
-        String::from("--admin"),
-        String::from("--elevated-confirmed"),
-    ];
-    if skip_checked {
-        parts.push(String::from("--skip-prompt-checked"));
-    }
-    if let Some(p_count) = custom_passes {
-        parts.push(String::from("--passes"));
-        parts.push(p_count.to_string());
-    }
-
-    let mut direct_parts = parts.clone();
-    for p in valid_paths {
-        direct_parts.push(quote_windows_cli_arg(&p.to_string_lossy()));
-    }
+    let (mut parts, abs_paths, direct_parts) =
+        build_elevated_relaunch_parts(valid_paths, custom_passes, skip_checked);
     let joined_direct = direct_parts.join(" ");
     let utf16_len: usize = joined_direct.encode_utf16().count();
 
@@ -5385,7 +5455,7 @@ fn relaunch_elevated_with_paths(
 
     let seq = ELEVATE_LIST_SEQ.fetch_add(1, Ordering::Relaxed);
     let list_path = env::temp_dir().join(format!("winshred_elev_{}_{}.lst", std::process::id(), seq));
-    let body = valid_paths
+    let body = abs_paths
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect::<Vec<_>>()
@@ -5481,7 +5551,13 @@ fn main() {
     if parsed.install {
         let is_admin = unsafe { IsUserAnAdmin() } != 0;
         if !is_admin {
-            elevate_relaunch("--install");
+            if !elevate_relaunch("--install") {
+                report_cli_error(
+                    "Administratorrechte fuer --install erforderlich (UAC abgebrochen oder fehlgeschlagen).",
+                    parsed.is_quiet,
+                );
+                std::process::exit(1);
+            }
             return;
         }
         let has_console = attach_parent_console_if_available();
@@ -5507,7 +5583,13 @@ fn main() {
     if parsed.uninstall {
         let is_admin = unsafe { IsUserAnAdmin() } != 0;
         if !is_admin {
-            elevate_relaunch("--uninstall");
+            if !elevate_relaunch("--uninstall") {
+                report_cli_error(
+                    "Administratorrechte fuer --uninstall erforderlich (UAC abgebrochen oder fehlgeschlagen).",
+                    parsed.is_quiet,
+                );
+                std::process::exit(1);
+            }
             return;
         }
         let has_console = attach_parent_console_if_available();
@@ -5634,6 +5716,8 @@ fn main() {
         }
         return;
     }
+
+    let valid_paths = deduplicate_and_prune_nested_paths(valid_paths);
 
     // Auf HDDs standardmäßig 3-Pass DoD 5220.22-M; auf SSD/NVMe & residenten Dateien intern immer 1 Pass (#7)
     let num_passes = custom_passes.unwrap_or(3);
@@ -6528,6 +6612,87 @@ mod tests {
         shred_recursive(&temp_dir, 1, &mut errs);
         assert_eq!(errs, 0);
         assert!(!temp_dir.exists());
+    }
+
+    #[test]
+    fn test_elevated_relaunch_parts_resolves_relative_and_adds_separator() {
+        let (_base, abs_paths, direct_parts) = build_elevated_relaunch_parts(
+            &[PathBuf::from("-dash-file.txt"), PathBuf::from("rel/sub.txt")],
+            Some(3),
+            true,
+        );
+        assert!(abs_paths.iter().all(|p| p.is_absolute()));
+        assert!(direct_parts.contains(&String::from("--")));
+        assert!(direct_parts.contains(&String::from("--skip-prompt-checked")));
+
+        // Prüfe, dass parse_cli_args mit "--" Pfade mit führendem '-' akzeptiert
+        let dash_rel = PathBuf::from("-dash-file.txt");
+        let parsed = parse_cli_args(["--admin", "--elevated-confirmed", "--", &dash_rel.to_string_lossy()]).unwrap();
+        assert_eq!(parsed.raw_paths, vec![dash_rel]);
+    }
+
+    #[test]
+    fn test_deduplicate_and_prune_nested_paths() {
+        let temp_dir = env::temp_dir().join(format!("winshred_dedup_{}", std::process::id()));
+        let sub_dir = temp_dir.join("ordner");
+        let target_dir = temp_dir.join("junc_target");
+        let junc_dir = temp_dir.join("junc_link");
+        fs::create_dir_all(&sub_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+
+        let child_file = sub_dir.join("kind.txt");
+        fs::write(&child_file, b"x").unwrap();
+        let target_file = target_dir.join("drin.txt");
+        fs::write(&target_file, b"y").unwrap();
+
+        let status = Command::new("cmd")
+            .args(["/c", "mklink", "/J", &junc_dir.to_string_lossy(), &target_dir.to_string_lossy()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        // Kind vor Eltern + Duplikat + Junction + Datei in Junction (darf NICHT gepruned werden)
+        let junc_child = junc_dir.join("drin.txt");
+        let deduped = deduplicate_and_prune_nested_paths(vec![
+            child_file.clone(),
+            sub_dir.clone(),
+            sub_dir.clone(),
+            junc_dir.clone(),
+            junc_child.clone(),
+        ]);
+
+        assert_eq!(deduped.len(), 3);
+        assert!(deduped.contains(&sub_dir));
+        assert!(deduped.contains(&junc_dir));
+        assert!(deduped.contains(&junc_child));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_relative_path_wide_exceeding_max_path_with_deep_cwd() {
+        let cwd_len = env::current_dir().map(|p| p.to_string_lossy().len()).unwrap_or(0);
+        // Ziel: cwd + "\" + rel >= 245 Zeichen, während rel selbst < 240 Zeichen bleibt
+        let target_rel_len = 246usize.saturating_sub(cwd_len + 1).min(238);
+        let mut rel = PathBuf::from("rel_a");
+        while rel.to_string_lossy().len() + 10 < target_rel_len {
+            rel = rel.join("seg1234567");
+        }
+        rel = rel.join("datei.txt");
+        assert!(rel.is_relative());
+        assert!(
+            rel.to_string_lossy().len() < 240,
+            "Relativer Pfad selbst soll < 240 Zeichen bleiben: {}",
+            rel.to_string_lossy().len()
+        );
+
+        let wide = path_to_wide(&rel);
+        let wide_str = String::from_utf16_lossy(&wide[..wide.len() - 1]);
+        assert!(
+            wide_str.starts_with(r"\\?\"),
+            "Relativer Pfad mit >240 Gesamtlänge muss Verbatim-Präfix erhalten: {}",
+            wide_str
+        );
     }
 }
 
