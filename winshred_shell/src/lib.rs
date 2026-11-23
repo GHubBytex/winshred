@@ -415,7 +415,7 @@ unsafe extern "system" fn cmd_invoke(
     let content = paths.join("\n");
     if fs::write(&list_path, content.as_bytes()).is_ok() {
         let mut cmd = Command::new(&exe_path);
-        cmd.arg("--filelist").arg(&list_path);
+        cmd.arg("--cleanup-filelist").arg(&list_path);
         if cmd.spawn().is_ok() {
             return S_OK;
         }

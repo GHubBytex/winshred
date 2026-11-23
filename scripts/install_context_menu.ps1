@@ -1,4 +1,4 @@
-# WinShred - Kontextmenü-Installer
+﻿# WinShred - Kontextmenü-Installer
 $ErrorActionPreference = "Stop"
 
 # Automatische UAC-Administrator-Elevation
@@ -58,7 +58,7 @@ if (Test-Path $sendToPath) {
     $shortcutPath = Join-Path $sendToPath "WinShred (Sicher vernichten).lnk"
     $shortcut = $wshShell.CreateShortcut($shortcutPath)
     $shortcut.TargetPath = $exePath
-    $shortcut.IconLocation = "$env:SystemRoot\System32\imageres.dll,5307"
+    $shortcut.IconLocation = "$env:SystemRoot\System32\imageres.dll,-5308"
     $shortcut.Description = "Dateien und Ordner mit WinShred sicher vernichten"
     $shortcut.Save()
     Write-Host "SendTo-Eintrag erstellt: $shortcutPath" -ForegroundColor Green

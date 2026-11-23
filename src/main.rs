@@ -9,7 +9,7 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -555,7 +555,21 @@ fn to_wide_chars(s: &str) -> Vec<u16> {
 }
 
 fn path_to_wide(path: &Path) -> Vec<u16> {
-    path.as_os_str().encode_wide().chain(Some(0)).collect()
+    let raw: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let s = path.to_string_lossy();
+    if raw.len() >= 240 && !s.starts_with(r"\\?\") && !s.starts_with(r"\\.\") {
+        let abs = resolve_absolute_no_symlink(path);
+        let abs_s = abs.to_string_lossy();
+        let verbatim = if abs_s.starts_with(r"\\?\") || abs_s.starts_with(r"\\.\") {
+            abs_s.into_owned()
+        } else if let Some(rest) = abs_s.strip_prefix(r"\\") {
+            format!(r"\\?\UNC\{}", rest)
+        } else {
+            format!(r"\\?\{}", abs_s)
+        };
+        return OsStr::new(&verbatim).encode_wide().chain(Some(0)).collect();
+    }
+    raw.into_iter().chain(Some(0)).collect()
 }
 
 pub unsafe fn force_foreground_window(hwnd: *mut c_void) {
@@ -635,12 +649,12 @@ fn show_message_box(text: &str, title: &str, flags: u32) -> i32 {
     }
 }
 
-fn elevate_relaunch(params: &str) {
+fn elevate_relaunch(params: &str) -> bool {
     if let Ok(exe) = env::current_exe() {
         let op = to_wide_chars("runas");
         let file = to_wide_chars(&exe.to_string_lossy());
         let wide_params = to_wide_chars(params);
-        unsafe {
+        let rc = unsafe {
             AllowSetForegroundWindow(ASFW_ANY);
             ShellExecuteW(
                 std::ptr::null_mut(),
@@ -649,9 +663,11 @@ fn elevate_relaunch(params: &str) {
                 wide_params.as_ptr(),
                 std::ptr::null(),
                 1,
-            );
-        }
+            )
+        };
+        return rc > 32;
     }
+    false
 }
 
 fn fill_random_bytes(buf: &mut [u8]) -> io::Result<()> {
@@ -701,8 +717,21 @@ impl Drop for OwnedHandle {
     }
 }
 
+/// Erkennt nackte Laufwerkspräfixe wie `"C:"` (ohne Backslash), damit sie nicht laufwerksrelativ auf das CWD aufgelöst werden.
+fn bare_drive_to_root(path: &Path) -> Option<PathBuf> {
+    let s = path.to_string_lossy();
+    let bytes = s.as_bytes();
+    if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Some(PathBuf::from(format!("{}\\", s)));
+    }
+    None
+}
+
 /// Löst relative Pfade sowie `.` und `..` auf, ohne Symlinks oder Junctions aufzulösen.
 fn resolve_absolute_no_symlink(path: &Path) -> PathBuf {
+    if let Some(root) = bare_drive_to_root(path) {
+        return root;
+    }
     std::path::absolute(path).unwrap_or_else(|_| {
         if path.is_relative() {
             env::current_dir()
@@ -967,6 +996,7 @@ pub fn query_allocated_ranges(file: &fs::File, total_len: u64) -> io::Result<Vec
     let mut cursor: i64 = 0;
 
     while cursor < total_i64 {
+        let prev_cursor = cursor;
         let query = FileAllocatedRangeBuffer {
             file_offset: cursor,
             length: total_i64 - cursor,
@@ -1015,7 +1045,7 @@ pub fn query_allocated_ranges(file: &fs::File, total_len: u64) -> io::Result<Vec
             }
         }
 
-        if ok != 0 {
+        if ok != 0 || cursor <= prev_cursor {
             break;
         }
     }
@@ -1292,25 +1322,38 @@ fn get_file_streams(path: &Path) -> Vec<String> {
     streams
 }
 
-fn shred_alternate_streams(path: &Path, num_passes: usize, is_ssd: bool) -> io::Result<()> {
+fn shred_alternate_streams_with_reporter<R: ShredReporter>(
+    path: &Path,
+    num_passes: usize,
+    is_ssd: bool,
+    reporter: &mut R,
+) -> io::Result<()> {
     let streams = get_file_streams(path);
 
     for stream_name in streams {
+        if reporter.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Vorgang durch Benutzer abgebrochen",
+            ));
+        }
         let mut stream_path = path.as_os_str().to_os_string();
         stream_path.push(&stream_name);
         let stream_path = PathBuf::from(stream_path);
 
-        if let Ok(mut file) = OpenOptions::new().write(true).read(true).open(&stream_path) {
-            let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-            if len > 0 {
-                let is_res = is_file_resident_in_mft(&file, len);
-                let _ = wipe_open_file(&mut file, len, num_passes, is_ssd, is_res);
-            }
+        let mut file = OpenOptions::new().write(true).read(true).open(&stream_path)?;
+        let len = file.metadata()?.len();
+        if len > 0 {
+            let is_res = is_file_resident_in_mft(&file, len);
+            wipe_open_file_with_reporter(&mut file, len, num_passes, is_ssd, is_res, reporter)?;
+        } else {
+            neutralize_timestamps(&file);
         }
+        drop(file);
 
         let wide_stream_path = path_to_wide(&stream_path);
-        unsafe {
-            DeleteFileW(wide_stream_path.as_ptr());
+        if unsafe { DeleteFileW(wide_stream_path.as_ptr()) } == 0 {
+            return Err(io::Error::last_os_error());
         }
     }
     Ok(())
@@ -2057,7 +2100,8 @@ fn compute_non_resident_wipe_len(path: &Path, file: &fs::File, len: u64) -> u64 
         )
     };
     if ret != 0 && std_info.allocation_size > 0 {
-        std_info.allocation_size as u64
+        // Bei komprimierten NTFS-Dateien kann AllocationSize < len sein; mindestens len überschreiben.
+        (std_info.allocation_size as u64).max(len)
     } else {
         let cluster_size = get_cluster_size(path);
         let remainder = len % cluster_size;
@@ -2118,7 +2162,7 @@ pub fn shred_file_with_reporter<R: ShredReporter>(
     let is_ssd = matches!(media_type, DriveMediaType::SsdNvme { .. });
 
     // Alternate Data Streams erst nach erfolgreichem Öffnen der Hauptdatei schreddern
-    let _ = shred_alternate_streams(path, num_passes, is_ssd);
+    shred_alternate_streams_with_reporter(path, num_passes, is_ssd, reporter)?;
 
     let len = file.metadata()?.len();
     if len > 0 {
@@ -2285,13 +2329,19 @@ pub fn shred_recursive_with_reporter<R: ShredReporter>(
         }
 
         // Eventuelle Alternate Data Streams des Verzeichnisses schreddern
+        let mut ro_guard = ReadonlyGuard::acquire(&clean_path);
         let is_ssd = matches!(
             get_drive_media_type(&clean_path),
             DriveMediaType::SsdNvme { .. }
         );
-        let _ = shred_alternate_streams(&clean_path, num_passes, is_ssd);
+        if let Err(e) = shred_alternate_streams_with_reporter(&clean_path, num_passes, is_ssd, reporter) {
+            if e.kind() == io::ErrorKind::Interrupted {
+                return;
+            }
+            *errors += 1;
+            eprintln!("Fehler beim Schreddern der Alternate Data Streams für {:?}: {}", clean_path, e);
+        }
 
-        let mut ro_guard = ReadonlyGuard::acquire(&clean_path);
         neutralize_dir_timestamps(&clean_path);
         match secure_single_rename(&clean_path) {
             Ok(final_dir_path) => {
@@ -2439,7 +2489,7 @@ fn schedule_self_delete_on_exit() {
     let install_dir = PathBuf::from(r"C:\Program Files\WinShred");
     let exe_path = install_dir.join("winshred.exe");
     let cmd_cleanup = format!(
-        "for /L %i in (1,1,30) do (del /f /q \"{}\" >nul 2>&1 & if not exist \"{}\" (rmdir \"{}\" >nul 2>&1 & exit) & ping -n 1 -w 300 127.0.0.1 >nul)",
+        "for /L %i in (1,1,30) do (del /f /q \"{}\" >nul 2>&1 & if not exist \"{}\" (rmdir \"{}\" >nul 2>&1 & exit) & ping -n 2 127.0.0.1 >nul)",
         exe_path.to_string_lossy(),
         exe_path.to_string_lossy(),
         install_dir.to_string_lossy(),
@@ -2735,10 +2785,9 @@ fn run_uninstall_backend() -> Result<(), String> {
     }
 
     if let Ok(current_exe) = env::current_exe() {
-        let in_install_dir = current_exe
-            .to_string_lossy()
-            .to_ascii_lowercase()
-            .starts_with(&install_dir.to_string_lossy().to_ascii_lowercase());
+        let norm_exe = normalize_win_path_for_compare(&current_exe, true);
+        let norm_dir = normalize_win_path_for_compare(&install_dir, true);
+        let in_install_dir = is_same_or_subpath(&norm_exe, &norm_dir);
         if !in_install_dir {
             let exe_path = install_dir.join("winshred.exe");
             if exe_path.exists() {
@@ -2801,7 +2850,10 @@ const PBS_MARQUEE: u32 = 0x0008;
 const BM_SETCHECK: u32 = 0x00F1;
 const BM_GETCHECK: u32 = 0x00F0;
 const BM_SETSTYLE: u32 = 0x00F4;
+const DM_GETDEFID: u32 = 0x0400;
 const DM_SETDEFID: u32 = 0x0401;
+const DC_HASDEFID: isize = 0x534B;
+const SS_NOPREFIX: u32 = 0x00000080;
 const BST_CHECKED: usize = 1;
 const BS_AUTORADIOBUTTON: u32 = 0x00000009;
 const BS_AUTOCHECKBOX: u32 = 0x00000003;
@@ -2990,6 +3042,26 @@ unsafe fn set_p3_finish_visible(visible: bool) {
     }
 }
 
+static WIZARD_DEF_ID: AtomicUsize = AtomicUsize::new(0);
+
+unsafe fn set_wizard_default_button(hwnd: *mut c_void, def_id: usize) {
+    WIZARD_DEF_ID.store(def_id, Ordering::SeqCst);
+    unsafe {
+        for (id, btn) in [
+            (ID_BTN_INSTALL, CTRLS.btn_install),
+            (ID_BTN_NEXT, CTRLS.btn_next),
+            (ID_BTN_FINISH, CTRLS.btn_finish),
+            (ID_BTN_CANCEL, CTRLS.btn_cancel),
+        ] {
+            if !btn.is_null() {
+                let style = if id == def_id { BS_DEFPUSHBUTTON } else { BS_PUSHBUTTON };
+                SendMessageW(btn, BM_SETSTYLE, style as usize, 1);
+            }
+        }
+        SendMessageW(hwnd, DM_SETDEFID, def_id, 0);
+    }
+}
+
 unsafe fn update_wizard_page(hwnd: *mut c_void) {
     unsafe {
         match CURRENT_PAGE {
@@ -3012,12 +3084,7 @@ unsafe fn update_wizard_page(hwnd: *mut c_void) {
                 EnableWindow(CTRLS.btn_cancel, 1);
                 show_ctrl(CTRLS.btn_finish, false);
 
-                SendMessageW(
-                    hwnd,
-                    DM_SETDEFID,
-                    if accepted { ID_BTN_NEXT } else { ID_BTN_CANCEL },
-                    0,
-                );
+                set_wizard_default_button(hwnd, if accepted { ID_BTN_NEXT } else { ID_BTN_CANCEL });
             }
             WizardPage::Config => {
                 set_lic_visible(false);
@@ -3028,7 +3095,7 @@ unsafe fn update_wizard_page(hwnd: *mut c_void) {
                     show_ctrl(CTRLS.btn_install, false);
                     show_ctrl(CTRLS.btn_next, true);
                     EnableWindow(CTRLS.btn_next, 1);
-                    SendMessageW(hwnd, DM_SETDEFID, ID_BTN_NEXT, 0);
+                    set_wizard_default_button(hwnd, ID_BTN_NEXT);
                 } else {
                     set_p1_install_visible(true);
                     set_p1_manage_visible(false);
@@ -3037,7 +3104,7 @@ unsafe fn update_wizard_page(hwnd: *mut c_void) {
                     show_ctrl(CTRLS.btn_install, true);
                     EnableWindow(CTRLS.btn_install, 1);
                     show_ctrl(CTRLS.btn_next, false);
-                    SendMessageW(hwnd, DM_SETDEFID, ID_BTN_INSTALL, 0);
+                    set_wizard_default_button(hwnd, ID_BTN_INSTALL);
                 }
                 set_p2_progress_visible(false);
                 set_p3_finish_visible(false);
@@ -3061,7 +3128,7 @@ unsafe fn update_wizard_page(hwnd: *mut c_void) {
                 EnableWindow(CTRLS.btn_cancel, 0);
                 show_ctrl(CTRLS.btn_finish, false);
 
-                SendMessageW(hwnd, DM_SETDEFID, 0, 0);
+                set_wizard_default_button(hwnd, 0);
                 SendMessageW(CTRLS.bar_p2_progress, PBM_SETMARQUEE, 1, 30);
             }
             WizardPage::Finish => {
@@ -3076,7 +3143,7 @@ unsafe fn update_wizard_page(hwnd: *mut c_void) {
                 show_ctrl(CTRLS.btn_next, false);
                 show_ctrl(CTRLS.btn_cancel, false);
                 show_ctrl(CTRLS.btn_finish, true);
-                SendMessageW(hwnd, DM_SETDEFID, ID_BTN_FINISH, 0);
+                set_wizard_default_button(hwnd, ID_BTN_FINISH);
                 SetFocus(CTRLS.btn_finish);
             }
         }
@@ -3132,14 +3199,26 @@ unsafe extern "system" fn installer_wnd_proc(
 ) -> isize {
     unsafe {
         match msg {
+            DM_SETDEFID => {
+                WIZARD_DEF_ID.store(wparam, Ordering::SeqCst);
+                1
+            }
+            DM_GETDEFID => {
+                let id = WIZARD_DEF_ID.load(Ordering::SeqCst);
+                if id != 0 {
+                    (DC_HASDEFID << 16) | (id & 0xFFFF) as isize
+                } else {
+                    0
+                }
+            }
             WM_COMMAND => {
                 let id = wparam & 0xFFFF;
                 if id == ID_RAD_LIC_ACCEPT {
                     EnableWindow(CTRLS.btn_next, 1);
-                    SendMessageW(hwnd, DM_SETDEFID, ID_BTN_NEXT, 0);
+                    set_wizard_default_button(hwnd, ID_BTN_NEXT);
                 } else if id == ID_RAD_LIC_DECLINE {
                     EnableWindow(CTRLS.btn_next, 0);
-                    SendMessageW(hwnd, DM_SETDEFID, ID_BTN_CANCEL, 0);
+                    set_wizard_default_button(hwnd, ID_BTN_CANCEL);
                 } else if id == ID_BTN_BACK {
                     if CURRENT_PAGE == WizardPage::Config && !IS_CURRENTLY_INSTALLED {
                         CURRENT_PAGE = WizardPage::License;
@@ -3610,7 +3689,7 @@ fn show_installer_wizard() {
         );
         CTRLS.lbl_p3_summary = create_ctrl(
             0, "STATIC", "",
-            WS_CHILD, 28, 108, 464, 215, hwnd, 0, H_FONT_REGULAR,
+            WS_CHILD | SS_NOPREFIX, 28, 108, 464, 215, hwnd, 0, H_FONT_REGULAR,
         );
 
         // --- Footer Buttons ---
@@ -3620,11 +3699,11 @@ fn show_installer_wizard() {
         );
         CTRLS.btn_install = create_ctrl(
             0, "BUTTON", "Installieren",
-            WS_CHILD | BS_DEFPUSHBUTTON | WS_TABSTOP, 294, 348, 100, 28, hwnd, ID_BTN_INSTALL, H_FONT_REGULAR,
+            WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP, 294, 348, 100, 28, hwnd, ID_BTN_INSTALL, H_FONT_REGULAR,
         );
         CTRLS.btn_next = create_ctrl(
             0, "BUTTON", "Weiter >",
-            WS_CHILD | BS_DEFPUSHBUTTON | WS_TABSTOP, 294, 348, 100, 28, hwnd, ID_BTN_NEXT, H_FONT_REGULAR,
+            WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP, 294, 348, 100, 28, hwnd, ID_BTN_NEXT, H_FONT_REGULAR,
         );
         CTRLS.btn_cancel = create_ctrl(
             0, "BUTTON", "Abbrechen",
@@ -3632,7 +3711,7 @@ fn show_installer_wizard() {
         );
         CTRLS.btn_finish = create_ctrl(
             0, "BUTTON", "Fertigstellen",
-            WS_CHILD | BS_DEFPUSHBUTTON | WS_TABSTOP, 394, 348, 100, 28, hwnd, ID_BTN_FINISH, H_FONT_REGULAR,
+            WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP, 394, 348, 100, 28, hwnd, ID_BTN_FINISH, H_FONT_REGULAR,
         );
 
         // Erste Seite initialisieren
@@ -3806,6 +3885,8 @@ static mut CONFIRM_LBL_IMPORTANT: *mut c_void = std::ptr::null_mut();
 static mut CONFIRM_CHK_SKIP: *mut c_void = std::ptr::null_mut();
 static mut CONFIRM_SKIP_CHECKED: bool = false;
 
+static CONFIRM_DEF_ID: AtomicUsize = AtomicUsize::new(102);
+
 unsafe extern "system" fn confirm_dialog_wnd_proc(
     hwnd: *mut c_void,
     msg: u32,
@@ -3814,6 +3895,18 @@ unsafe extern "system" fn confirm_dialog_wnd_proc(
 ) -> isize {
     unsafe {
         match msg {
+            DM_SETDEFID => {
+                CONFIRM_DEF_ID.store(wparam, Ordering::SeqCst);
+                1
+            }
+            DM_GETDEFID => {
+                let id = CONFIRM_DEF_ID.load(Ordering::SeqCst);
+                if id != 0 {
+                    (DC_HASDEFID << 16) | (id & 0xFFFF) as isize
+                } else {
+                    0
+                }
+            }
             WM_COMMAND => {
                 let id = wparam & 0xFFFF;
                 if id == 101 || id == 102 {
@@ -4038,7 +4131,7 @@ pub fn show_confirmation_dialog(
         );
         CONFIRM_HDR_SUB = create_ctrl(
             0, "STATIC", &prompt_sub,
-            WS_CHILD | WS_VISIBLE, 65, 44, 455, 36, hwnd, 0, H_FONT_SUBTITLE,
+            WS_CHILD | WS_VISIBLE | SS_NOPREFIX, 65, 44, 455, 36, hwnd, 0, H_FONT_SUBTITLE,
         );
 
         // Detailbereich
@@ -4086,7 +4179,7 @@ pub fn show_confirmation_dialog(
             );
             CONFIRM_LBL_IMPORTANT = create_ctrl(
                 0, "STATIC", &warn_text,
-                WS_CHILD | WS_VISIBLE, 22, next_y, 496, 28, hwnd, 0, H_FONT_BOLD,
+                WS_CHILD | WS_VISIBLE | SS_NOPREFIX, 22, next_y, 496, 28, hwnd, 0, H_FONT_BOLD,
             );
             next_y += 34;
         }
@@ -4145,6 +4238,7 @@ pub fn show_confirmation_dialog(
             );
         }
 
+        CONFIRM_DEF_ID.store(102, Ordering::SeqCst);
         force_foreground_window(hwnd);
 
         let mut msg: MSG = std::mem::zeroed();
@@ -4176,6 +4270,8 @@ static mut FINAL_BTN_CONFIRM: *mut c_void = std::ptr::null_mut();
 static mut FINAL_CHK_SKIP: *mut c_void = std::ptr::null_mut();
 static mut FINAL_SKIP_CHECKED: bool = false;
 
+static FINAL_DEF_ID: AtomicUsize = AtomicUsize::new(0);
+
 unsafe extern "system" fn final_warning_wnd_proc(
     hwnd: *mut c_void,
     msg: u32,
@@ -4184,6 +4280,18 @@ unsafe extern "system" fn final_warning_wnd_proc(
 ) -> isize {
     unsafe {
         match msg {
+            DM_SETDEFID => {
+                FINAL_DEF_ID.store(wparam, Ordering::SeqCst);
+                1
+            }
+            DM_GETDEFID => {
+                let id = FINAL_DEF_ID.load(Ordering::SeqCst);
+                if id != 0 {
+                    (DC_HASDEFID << 16) | (id & 0xFFFF) as isize
+                } else {
+                    0
+                }
+            }
             WM_TIMER => {
                 if wparam == ID_FINAL_TIMER {
                     let prev = FINAL_COUNTDOWN.load(Ordering::SeqCst);
@@ -4294,6 +4402,7 @@ pub fn show_final_warning_dialog(
     important_reasons: &[String],
     admin_purge_active: bool,
     force_prompt: bool,
+    initial_skip_checked: bool,
 ) -> (bool, bool) {
     unsafe {
         FINAL_CONFIRMED = false;
@@ -4301,7 +4410,7 @@ pub fn show_final_warning_dialog(
         FINAL_LBL_IMPORTANT = std::ptr::null_mut();
         FINAL_BTN_CONFIRM = std::ptr::null_mut();
         FINAL_CHK_SKIP = std::ptr::null_mut();
-        FINAL_SKIP_CHECKED = get_skip_safety_prompt();
+        FINAL_SKIP_CHECKED = initial_skip_checked;
         init_gui_resources();
 
         let instance = GetModuleHandleW(std::ptr::null());
@@ -4381,7 +4490,7 @@ pub fn show_final_warning_dialog(
         );
         FINAL_HDR_SUB = create_ctrl(
             0, "STATIC", &sub_text,
-            WS_CHILD | WS_VISIBLE, 64, 40, 416, 24, hwnd, 0, H_FONT_SUBTITLE,
+            WS_CHILD | WS_VISIBLE | SS_NOPREFIX, 64, 40, 416, 24, hwnd, 0, H_FONT_SUBTITLE,
         );
 
         create_ctrl(
@@ -4410,7 +4519,7 @@ pub fn show_final_warning_dialog(
             );
             FINAL_LBL_IMPORTANT = create_ctrl(
                 0, "STATIC", &imp_text,
-                WS_CHILD | WS_VISIBLE, 22, next_y, 456, 36, hwnd, 0, H_FONT_BOLD,
+                WS_CHILD | WS_VISIBLE | SS_NOPREFIX, 22, next_y, 456, 36, hwnd, 0, H_FONT_BOLD,
             );
             next_y += 44;
         }
@@ -4466,6 +4575,7 @@ pub fn show_final_warning_dialog(
         );
 
         // Solange der 2-Sekunden-Countdown läuft, darf Enter NICHT bestätigen
+        FINAL_DEF_ID.store(0, Ordering::SeqCst);
         SendMessageW(hwnd, DM_SETDEFID, 0, 0);
         SetTimer(hwnd, ID_FINAL_TIMER, 1000, std::ptr::null_mut());
         force_foreground_window(hwnd);
@@ -4920,7 +5030,7 @@ pub fn show_shred_progress_dialog(
         );
         PROG_CTRLS.lbl_subtitle = create_ctrl(
             0, "STATIC", "Initialisiere...",
-            WS_CHILD | WS_VISIBLE, 65, 38, 435, 20, hwnd, 0, H_FONT_SUBTITLE,
+            WS_CHILD | WS_VISIBLE | SS_NOPREFIX, 65, 38, 435, 20, hwnd, 0, H_FONT_SUBTITLE,
         );
 
         // Progress Bar
@@ -5126,8 +5236,9 @@ struct ParsedCliArgs {
     is_quiet: bool,
     purge_journal: bool,
     elevated_confirmed: bool,
+    skip_prompt_checked: bool,
     custom_passes: Option<usize>,
-    filelists: Vec<PathBuf>,
+    filelists: Vec<(PathBuf, bool)>,
     raw_paths: Vec<PathBuf>,
 }
 
@@ -5174,6 +5285,7 @@ where
                 parsed.elevated_confirmed = true;
                 parsed.purge_journal = true;
             }
+            "--skip-prompt-checked" => parsed.skip_prompt_checked = true,
             "--purge-journal" | "-p" => parsed.purge_journal = true,
             "--passes" => {
                 let val = iter
@@ -5188,7 +5300,16 @@ where
                 if val.trim().is_empty() {
                     return Err(String::from("Option --filelist erfordert einen nicht-leeren Pfad."));
                 }
-                parsed.filelists.push(PathBuf::from(val));
+                parsed.filelists.push((PathBuf::from(val), false));
+            }
+            "--cleanup-filelist" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| String::from("Option --cleanup-filelist erfordert einen Dateipfad."))?;
+                if val.trim().is_empty() {
+                    return Err(String::from("Option --cleanup-filelist erfordert einen nicht-leeren Pfad."));
+                }
+                parsed.filelists.push((PathBuf::from(val), true));
             }
             _ => {
                 if let Some(val) = arg.strip_prefix("--passes=") {
@@ -5197,7 +5318,12 @@ where
                     if val.trim().is_empty() {
                         return Err(String::from("Option --filelist erfordert einen nicht-leeren Pfad."));
                     }
-                    parsed.filelists.push(PathBuf::from(val));
+                    parsed.filelists.push((PathBuf::from(val), false));
+                } else if let Some(val) = arg.strip_prefix("--cleanup-filelist=") {
+                    if val.trim().is_empty() {
+                        return Err(String::from("Option --cleanup-filelist erfordert einen nicht-leeren Pfad."));
+                    }
+                    parsed.filelists.push((PathBuf::from(val), true));
                 } else if arg.starts_with('-') {
                     return Err(format!("Unbekanntes Argument: {}", arg));
                 } else {
@@ -5228,11 +5354,18 @@ fn read_paths_from_filelist(list_path: &Path, delete_after: bool) -> Result<Vec<
 
 static ELEVATE_LIST_SEQ: AtomicU32 = AtomicU32::new(1);
 
-fn relaunch_elevated_with_paths(valid_paths: &[PathBuf], custom_passes: Option<usize>) {
+fn relaunch_elevated_with_paths(
+    valid_paths: &[PathBuf],
+    custom_passes: Option<usize>,
+    skip_checked: bool,
+) {
     let mut parts = vec![
         String::from("--admin"),
         String::from("--elevated-confirmed"),
     ];
+    if skip_checked {
+        parts.push(String::from("--skip-prompt-checked"));
+    }
     if let Some(p_count) = custom_passes {
         parts.push(String::from("--passes"));
         parts.push(p_count.to_string());
@@ -5246,7 +5379,7 @@ fn relaunch_elevated_with_paths(valid_paths: &[PathBuf], custom_passes: Option<u
     let utf16_len: usize = joined_direct.encode_utf16().count();
 
     if utf16_len <= 28_000 {
-        elevate_relaunch(&joined_direct);
+        let _ = elevate_relaunch(&joined_direct);
         return;
     }
 
@@ -5258,11 +5391,13 @@ fn relaunch_elevated_with_paths(valid_paths: &[PathBuf], custom_passes: Option<u
         .collect::<Vec<_>>()
         .join("\n");
     if fs::write(&list_path, body).is_ok() {
-        parts.push(String::from("--filelist"));
+        parts.push(String::from("--cleanup-filelist"));
         parts.push(quote_windows_cli_arg(&list_path.to_string_lossy()));
-        elevate_relaunch(&parts.join(" "));
+        if !elevate_relaunch(&parts.join(" ")) {
+            let _ = fs::remove_file(&list_path);
+        }
     } else {
-        elevate_relaunch(&joined_direct);
+        let _ = elevate_relaunch(&joined_direct);
     }
 }
 
@@ -5399,11 +5534,16 @@ fn main() {
 
     if parsed.reset_prompts {
         set_skip_safety_prompt(false);
-        show_message_box(
-            "Die Sicherheitsprüfung vor dem Vernichten wurde wieder aktiviert.",
-            "WinShred - Einstellung zurückgesetzt",
-            MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND,
-        );
+        if parsed.is_quiet {
+            let _ = attach_parent_console_if_available();
+            println!("Die Sicherheitspruefung vor dem Vernichten wurde wieder aktiviert.");
+        } else {
+            show_message_box(
+                "Die Sicherheitsprüfung vor dem Vernichten wurde wieder aktiviert.",
+                "WinShred - Einstellung zurückgesetzt",
+                MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND,
+            );
+        }
         return;
     }
 
@@ -5419,8 +5559,8 @@ fn main() {
     }
 
     let mut candidate_paths = parsed.raw_paths;
-    for list_path in &parsed.filelists {
-        match read_paths_from_filelist(list_path, true) {
+    for (list_path, delete_after) in &parsed.filelists {
+        match read_paths_from_filelist(list_path, *delete_after) {
             Ok(mut listed) => candidate_paths.append(&mut listed),
             Err(err) => {
                 if is_quiet {
@@ -5501,25 +5641,26 @@ fn main() {
     let is_admin = unsafe { IsUserAnAdmin() } != 0;
     let has_important = !important_reasons.is_empty();
     let skip_saved = get_skip_safety_prompt();
-    let should_prompt = !auto_confirm && (has_important || !skip_saved);
+    let should_prompt = !auto_confirm && (has_important || !skip_saved || elevated_confirmed);
 
-    // Sicherheitsabfrage vor dem Vernichten (#17 & #18)
+    // Sicherheitsabfrage vor dem Vernichten (#17, #18 & #22)
     if should_prompt {
+        let mut initial_skip = skip_saved || parsed.skip_prompt_checked;
         if !elevated_confirmed {
             let (choice, skip_checked) =
                 show_confirmation_dialog(&valid_paths, is_admin, &important_reasons, num_passes);
             match choice {
                 ConfirmationResult::Cancel => return,
                 ConfirmationResult::ShredStandard => {
-                    set_skip_safety_prompt(skip_checked);
+                    initial_skip = skip_checked;
                     purge_journal = false;
                 }
                 ConfirmationResult::ShredAsAdmin => {
-                    set_skip_safety_prompt(skip_checked);
                     if !is_admin {
-                        relaunch_elevated_with_paths(&valid_paths, custom_passes);
+                        relaunch_elevated_with_paths(&valid_paths, custom_passes, skip_checked);
                         return;
                     } else {
+                        initial_skip = skip_checked;
                         purge_journal = true;
                     }
                 }
@@ -5532,6 +5673,7 @@ fn main() {
             &important_reasons,
             purge_journal && is_admin,
             has_important,
+            initial_skip,
         );
         if !confirmed {
             return;
@@ -6160,9 +6302,22 @@ mod tests {
         let help = parse_cli_args(["--help"]).unwrap();
         assert!(help.show_help);
 
-        let eq = parse_cli_args(["--passes=5", "--filelist=C:\\tmp\\list.txt"]).unwrap();
+        let eq = parse_cli_args([
+            "--passes=5",
+            "--filelist=C:\\tmp\\list.txt",
+            "--cleanup-filelist=C:\\tmp\\temp.lst",
+            "--skip-prompt-checked",
+        ])
+        .unwrap();
         assert_eq!(eq.custom_passes, Some(5));
-        assert_eq!(eq.filelists, vec![PathBuf::from(r"C:\tmp\list.txt")]);
+        assert!(eq.skip_prompt_checked);
+        assert_eq!(
+            eq.filelists,
+            vec![
+                (PathBuf::from(r"C:\tmp\list.txt"), false),
+                (PathBuf::from(r"C:\tmp\temp.lst"), true),
+            ]
+        );
 
         assert!(parse_cli_args(["--passes", "0", "a.txt"]).is_err());
         assert!(parse_cli_args(["--passes", "abc"]).is_err());
@@ -6211,6 +6366,168 @@ mod tests {
         assert_eq!(bytes, expected_big + 15);
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_bare_drive_and_users_protection_with_cwd_on_same_drive() {
+        // Laufwerk des aktuellen CWD darf als "<Drive>:" niemals auf das CWD aufgelöst und freigegeben werden (#19)
+        if let Ok(cwd) = env::current_dir()
+            && let Some(drive) = extract_drive_letter(&cwd)
+        {
+            assert!(
+                is_dangerous_or_root_path(Path::new(&drive)),
+                "Nacktes Laufwerk '{}' muss unabhängig vom CWD blockiert sein",
+                drive
+            );
+        }
+
+        // SystemDrive\Users und Benutzerprofile müssen erkannt werden, auch wenn SystemDrive ohne '\' in env steht
+        if let Ok(sys_drive) = env::var("SystemDrive") {
+            let clean_drive = sys_drive.trim_end_matches('\\');
+            let users_root = PathBuf::from(format!("{}\\Users", clean_drive));
+            assert!(
+                matches!(classify_path_safety(&users_root), PathSafetyLevel::Blocked(_)),
+                "{:?} muss Blocked sein",
+                users_root
+            );
+            let users_public = users_root.join("Public");
+            assert!(
+                matches!(classify_path_safety(&users_public), PathSafetyLevel::Blocked(_)),
+                "{:?} muss Blocked sein",
+                users_public
+            );
+        }
+    }
+
+    #[test]
+    fn test_compressed_file_wipe_len_at_least_logical_len() {
+        const FSCTL_SET_COMPRESSION: u32 = 0x0009C040;
+        const COMPRESSION_FORMAT_DEFAULT: u16 = 1;
+
+        let temp_dir = env::temp_dir().join(format!("winshred_comp_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let cpath = temp_dir.join("compressed.bin");
+
+        let logical_len = 256 * 1024u64;
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&cpath)
+                .unwrap();
+            let fmt = COMPRESSION_FORMAT_DEFAULT;
+            let mut bret = 0u32;
+            let _ = unsafe {
+                DeviceIoControl(
+                    f.as_raw_handle(),
+                    FSCTL_SET_COMPRESSION,
+                    &fmt as *const u16 as *const c_void,
+                    std::mem::size_of::<u16>() as u32,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut bret,
+                    std::ptr::null_mut(),
+                )
+            };
+            // Hochgradig komprimierbare Null-Daten (NTFS komprimiert AllocationSize << logical_len)
+            f.write_all(&vec![0u8; logical_len as usize]).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        {
+            let f = OpenOptions::new().read(true).open(&cpath).unwrap();
+            let wipe_len = compute_non_resident_wipe_len(&cpath, &f, logical_len);
+            assert!(
+                wipe_len >= logical_len,
+                "wipe_len ({}) darf auch bei komprimierten Dateien nicht kleiner als len ({}) sein",
+                wipe_len,
+                logical_len
+            );
+        }
+
+        shred_file(&cpath, 1).unwrap();
+        assert!(!cpath.exists());
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_user_filelist_preserved_while_cleanup_filelist_deleted() {
+        let temp_dir = env::temp_dir().join(format!("winshred_user_fl_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let list_path = temp_dir.join("user_list.txt");
+        fs::write(&list_path, "C:\\Dummy\\a.txt\n").unwrap();
+
+        let paths = read_paths_from_filelist(&list_path, false).unwrap();
+        assert_eq!(paths, vec![PathBuf::from(r"C:\Dummy\a.txt")]);
+        assert!(list_path.exists(), "Benutzer-Dateiliste darf nicht gelöscht werden");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_ads_reporter_and_cancel() {
+        let temp_dir = env::temp_dir().join(format!("winshred_ads_rep_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let fpath = temp_dir.join("host.txt");
+        fs::write(&fpath, b"main").unwrap();
+        let ads_path = format!("{}:stream1:$DATA", fpath.to_string_lossy());
+        {
+            let mut ads = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&ads_path)
+                .unwrap();
+            ads.write_all(b"secret_ads_payload").unwrap();
+        }
+
+        struct CancelReporter;
+        impl ShredReporter for CancelReporter {
+            fn is_cancelled(&self) -> bool { true }
+        }
+        let mut cancel_rep = CancelReporter;
+        let res = shred_alternate_streams_with_reporter(&fpath, 1, true, &mut cancel_rep);
+        assert!(res.is_err());
+        assert_eq!(fs::read_to_string(&ads_path).unwrap(), "secret_ads_payload");
+
+        struct CountReporter { bytes: u64 }
+        impl ShredReporter for CountReporter {
+            fn on_bytes_written(&mut self, b: u64) { self.bytes += b; }
+        }
+        let mut count_rep = CountReporter { bytes: 0 };
+        shred_alternate_streams_with_reporter(&fpath, 1, true, &mut count_rep).unwrap();
+        assert!(count_rep.bytes >= 18);
+        assert!(get_file_streams(&fpath).is_empty());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_long_path_wide_and_shred() {
+        let temp_dir = env::temp_dir().join(format!("winshred_long_{}", std::process::id()));
+        let mut deep_dir = temp_dir.clone();
+        for i in 0..8 {
+            deep_dir = deep_dir.join(format!("verzeichnispfad_segment_{:02}_abcdef1234567890", i));
+        }
+        fs::create_dir_all(&deep_dir).unwrap();
+        let deep_file = deep_dir.join("geheime_datei_mit_langem_namen.txt");
+        assert!(
+            deep_file.to_string_lossy().len() > 265,
+            "Testpfad sollte > 265 Zeichen sein: {}",
+            deep_file.to_string_lossy().len()
+        );
+        fs::write(&deep_file, b"Long path secret payload").unwrap();
+
+        let wide = path_to_wide(&deep_file);
+        let wide_str = String::from_utf16_lossy(&wide[..wide.len() - 1]);
+        assert!(wide_str.starts_with(r"\\?\"), "Langer Pfad muss Verbatim-Präfix erhalten: {}", wide_str);
+
+        let mut errs = 0;
+        shred_recursive(&temp_dir, 1, &mut errs);
+        assert_eq!(errs, 0);
+        assert!(!temp_dir.exists());
     }
 }
 
