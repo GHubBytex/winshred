@@ -109,7 +109,7 @@ $manifestContent = @"
   <Identity Name="WinShred.ShellExtension"
             ProcessorArchitecture="x64"
             Publisher="CN=WinShred"
-            Version="1.1.0.0" />
+            Version="1.2.0.0" />
   <Properties>
     <DisplayName>WinShred</DisplayName>
     <PublisherDisplayName>WinShred</PublisherDisplayName>
