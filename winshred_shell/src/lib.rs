@@ -1,8 +1,9 @@
 use std::ffi::{c_void, OsStr};
+use std::fs;
 use std::os::windows::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -50,16 +51,21 @@ pub const E_FAIL: HRESULT = -2147467259;
 pub const E_NOTIMPL: HRESULT = -2147467263;
 pub const CLASS_E_NOAGGREGATION: HRESULT = -2147221232;
 
-static mut HMODULE_INSTANCE: *mut c_void = std::ptr::null_mut();
+static HMODULE_INSTANCE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
+/// Windows DLL Entry Point.
+///
+/// # Safety
+/// Wird ausschließlich vom Windows-Loader beim Laden/Entladen der DLL aufgerufen.
 #[no_mangle]
 pub unsafe extern "system" fn DllMain(
     h_inst: *mut c_void,
     reason: u32,
     _reserved: *mut c_void,
 ) -> i32 {
-    if reason == 1 { // DLL_PROCESS_ATTACH
-        HMODULE_INSTANCE = h_inst;
+    if reason == 1 {
+        // DLL_PROCESS_ATTACH
+        HMODULE_INSTANCE.store(h_inst, Ordering::SeqCst);
     }
     1
 }
@@ -80,6 +86,48 @@ unsafe extern "system" {
 }
 
 static SERVER_LOCKS: AtomicU32 = AtomicU32::new(0);
+static FILELIST_SEQ: AtomicU32 = AtomicU32::new(0);
+
+fn dec_server_locks() {
+    let _ = SERVER_LOCKS.try_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+        Some(v.saturating_sub(1))
+    });
+}
+
+/// Sucht eine zugehörige Datei (`winshred.exe` / `winshred.ico`) zuerst neben dieser DLL
+/// und fällt bei Bedarf auf das Standard-Installationsverzeichnis zurück.
+fn find_companion_file(filename: &str) -> Option<PathBuf> {
+    let hmod = HMODULE_INSTANCE.load(Ordering::SeqCst);
+    if !hmod.is_null() {
+        let mut mod_buf = [0u16; 1024];
+        let len = unsafe { GetModuleFileNameW(hmod, mod_buf.as_mut_ptr(), mod_buf.len() as u32) };
+        if len > 0 {
+            let dll_path = String::from_utf16_lossy(&mod_buf[..len as usize]);
+            if let Some(dir) = PathBuf::from(dll_path).parent() {
+                let candidate = dir.join(filename);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    let fallback = PathBuf::from(r"C:\Program Files\WinShred").join(filename);
+    if fallback.exists() {
+        Some(fallback)
+    } else {
+        None
+    }
+}
+
+/// Berechnet die benötigte Kommandozeilenlänge in UTF-16-Code-Units inkl. Quoting-Reserve.
+fn estimate_utf16_cmdline_len(exe_path: &Path, args: &[String]) -> usize {
+    let mut total = exe_path.as_os_str().encode_wide().count() + 4;
+    for a in args {
+        total += a.encode_utf16().count() + 4;
+    }
+    total
+}
 
 fn alloc_co_string(s: &str) -> *mut u16 {
     let wide: Vec<u16> = OsStr::new(s).encode_wide().chain(Some(0)).collect();
@@ -195,10 +243,13 @@ unsafe extern "system" fn cmd_add_ref(this: *mut WinShredCommand) -> u32 {
 }
 
 unsafe extern "system" fn cmd_release(this: *mut WinShredCommand) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
     let obj = &*this;
     let count = obj.ref_count.fetch_sub(1, Ordering::SeqCst) - 1;
     if count == 0 {
-        SERVER_LOCKS.fetch_sub(1, Ordering::SeqCst);
+        dec_server_locks();
         drop(Box::from_raw(this));
     }
     count
@@ -228,28 +279,10 @@ unsafe extern "system" fn cmd_get_icon(
     if ppsz_icon.is_null() {
         return E_POINTER;
     }
-    let icon_path = "C:\\Program Files\\WinShred\\winshred.ico";
-    if PathBuf::from(icon_path).exists() {
-        *ppsz_icon = alloc_co_string(icon_path);
+    if let Some(p) = find_companion_file("winshred.ico") {
+        *ppsz_icon = alloc_co_string(&p.to_string_lossy());
     } else {
-        let mut found_path: Option<PathBuf> = None;
-        let mut mod_buf = [0u16; 1024];
-        let len = GetModuleFileNameW(HMODULE_INSTANCE, mod_buf.as_mut_ptr(), 1024);
-        if len > 0 {
-            let dll_path = String::from_utf16_lossy(&mod_buf[..len as usize]);
-            if let Some(d) = PathBuf::from(dll_path).parent() {
-                let candidate = d.join("winshred.ico");
-                if candidate.exists() {
-                    found_path = Some(candidate);
-                }
-            }
-        }
-
-        if let Some(p) = found_path {
-            *ppsz_icon = alloc_co_string(&p.to_string_lossy());
-        } else {
-            *ppsz_icon = alloc_co_string("imageres.dll,-5308");
-        }
+        *ppsz_icon = alloc_co_string("imageres.dll,-5308");
     }
     if (*ppsz_icon).is_null() {
         E_FAIL
@@ -358,50 +391,39 @@ unsafe extern "system" fn cmd_invoke(
         return S_OK;
     }
 
-    // Ermittle den Pfad zur winshred.exe (primär im Installationsordner oder neben dieser DLL)
-    let mut exe_path = PathBuf::from("C:\\Program Files\\WinShred\\winshred.exe");
-    if !exe_path.exists() {
-        let mut mod_buf = [0u16; 1024];
-        let len = GetModuleFileNameW(HMODULE_INSTANCE, mod_buf.as_mut_ptr(), 1024);
-        if len > 0 {
-            let dll_path = String::from_utf16_lossy(&mod_buf[..len as usize]);
-            if let Some(d) = PathBuf::from(dll_path).parent() {
-                let candidate = d.join("winshred.exe");
-                if candidate.exists() {
-                    exe_path = candidate;
-                }
-            }
-        }
-    }
+    // Ermittle den Pfad zur winshred.exe (primär neben dieser DLL, sonst Installationsordner)
+    let exe_path = find_companion_file("winshred.exe")
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\WinShred\winshred.exe"));
 
-    // Windows Command-Line Limit (32.767 Zeichen) absichern durch Batching
-    let mut current_batch: Vec<&str> = Vec::new();
-    let mut current_len: usize = exe_path.to_string_lossy().len() + 10;
-
-    for p in &paths {
-        let p_len = p.len() + 3;
-        if current_len + p_len > 30000 && !current_batch.is_empty() {
-            let mut cmd = Command::new(&exe_path);
-            for arg in &current_batch {
-                cmd.arg(arg);
-            }
-            let _ = cmd.spawn();
-            current_batch.clear();
-            current_len = exe_path.to_string_lossy().len() + 10;
-        }
-        current_batch.push(p);
-        current_len += p_len;
-    }
-
-    if !current_batch.is_empty() {
+    // Windows Command-Line Limit (32.767 UTF-16-Code-Units) beachten:
+    // Bei großen Auswahlmengen per temporärer Dateiliste übergeben, damit nur ein einzelner Prozess startet.
+    const MAX_CMDLINE_UTF16: usize = 30000;
+    if estimate_utf16_cmdline_len(&exe_path, &paths) <= MAX_CMDLINE_UTF16 {
         let mut cmd = Command::new(&exe_path);
-        for arg in &current_batch {
-            cmd.arg(arg);
+        for p in &paths {
+            cmd.arg(p);
         }
-        let _ = cmd.spawn();
+        return if cmd.spawn().is_ok() { S_OK } else { E_FAIL };
     }
 
-    S_OK
+    let seq = FILELIST_SEQ.fetch_add(1, Ordering::Relaxed);
+    let list_path = std::env::temp_dir().join(format!(
+        "winshred_invoke_{}_{}.lst",
+        std::process::id(),
+        seq
+    ));
+    let content = paths.join("\n");
+    if fs::write(&list_path, content.as_bytes()).is_ok() {
+        let mut cmd = Command::new(&exe_path);
+        cmd.arg("--filelist").arg(&list_path);
+        if cmd.spawn().is_ok() {
+            return S_OK;
+        }
+        let _ = fs::remove_file(&list_path);
+        return E_FAIL;
+    }
+
+    E_FAIL
 }
 
 // ==========================================
@@ -455,10 +477,13 @@ unsafe extern "system" fn factory_add_ref(this: *mut WinShredClassFactory) -> u3
 }
 
 unsafe extern "system" fn factory_release(this: *mut WinShredClassFactory) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
     let obj = &*this;
     let count = obj.ref_count.fetch_sub(1, Ordering::SeqCst) - 1;
     if count == 0 {
-        SERVER_LOCKS.fetch_sub(1, Ordering::SeqCst);
+        dec_server_locks();
         drop(Box::from_raw(this));
     }
     count
@@ -487,7 +512,7 @@ unsafe extern "system" fn factory_lock_server(_this: *mut WinShredClassFactory, 
     if lock != 0 {
         SERVER_LOCKS.fetch_add(1, Ordering::SeqCst);
     } else {
-        SERVER_LOCKS.fetch_sub(1, Ordering::SeqCst);
+        dec_server_locks();
     }
     S_OK
 }
@@ -495,18 +520,26 @@ unsafe extern "system" fn factory_lock_server(_this: *mut WinShredClassFactory, 
 // ==========================================
 // DLL Exports
 // ==========================================
+
+/// COM Class Factory Export.
+///
+/// # Safety
+/// `rclsid`, `riid` und `ppv` müssen gültige Zeiger gemäß COM-Spezifikation sein.
 #[no_mangle]
 pub unsafe extern "system" fn DllGetClassObject(
     rclsid: *const GUID,
     riid: *const GUID,
     ppv: *mut *mut c_void,
 ) -> HRESULT {
-    if rclsid.is_null() || riid.is_null() || ppv.is_null() {
+    if ppv.is_null() {
+        return E_POINTER;
+    }
+    *ppv = std::ptr::null_mut();
+    if rclsid.is_null() || riid.is_null() {
         return E_POINTER;
     }
 
     if *rclsid != CLSID_WINSHREDCOMMAND {
-        *ppv = std::ptr::null_mut();
         return -2147221231; // CLASS_E_CLASSNOTAVAILABLE
     }
 
@@ -527,5 +560,37 @@ pub extern "system" fn DllCanUnloadNow() -> HRESULT {
         S_OK
     } else {
         S_FALSE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lock_server_underflow_protection() {
+        SERVER_LOCKS.store(0, Ordering::SeqCst);
+        unsafe {
+            assert_eq!(factory_lock_server(std::ptr::null_mut(), 0), S_OK);
+        }
+        assert_eq!(SERVER_LOCKS.load(Ordering::SeqCst), 0);
+        assert_eq!(DllCanUnloadNow(), S_OK);
+
+        unsafe {
+            assert_eq!(factory_lock_server(std::ptr::null_mut(), 1), S_OK);
+        }
+        assert_eq!(DllCanUnloadNow(), S_FALSE);
+        unsafe {
+            assert_eq!(factory_lock_server(std::ptr::null_mut(), 0), S_OK);
+        }
+        assert_eq!(DllCanUnloadNow(), S_OK);
+    }
+
+    #[test]
+    fn test_utf16_cmdline_estimation() {
+        let exe = PathBuf::from(r"C:\Program Files\WinShred\winshred.exe");
+        let args = vec![r"C:\Temp\äöü_datei.txt".to_string()];
+        let len = estimate_utf16_cmdline_len(&exe, &args);
+        assert!(len > 40 && len < 100);
     }
 }

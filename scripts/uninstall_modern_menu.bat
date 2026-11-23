@@ -17,8 +17,13 @@ echo.
 
 if exist "winshred.exe" (
     winshred.exe --uninstall
-    echo.
-    echo Deinstallation abgeschlossen.
+    if errorlevel 1 (
+        echo.
+        echo [FEHLER] Deinstallation ist fehlgeschlagen!
+    ) else (
+        echo.
+        echo Deinstallation abgeschlossen.
+    )
 ) else (
     echo [FEHLER] winshred.exe nicht gefunden! Bitte zuerst build.bat ausfuehren.
 )

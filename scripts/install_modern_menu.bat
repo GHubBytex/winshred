@@ -17,8 +17,13 @@ echo.
 
 if exist "winshred.exe" (
     winshred.exe --install
-    echo.
-    echo Installation abgeschlossen.
+    if errorlevel 1 (
+        echo.
+        echo [FEHLER] Installation ist fehlgeschlagen!
+    ) else (
+        echo.
+        echo Installation abgeschlossen.
+    )
 ) else (
     echo [FEHLER] winshred.exe nicht gefunden! Bitte zuerst build.bat ausfuehren.
 )

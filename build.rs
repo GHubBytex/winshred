@@ -1,31 +1,86 @@
+use std::path::{Path, PathBuf};
+
+fn find_rc_exe() -> Option<PathBuf> {
+    let arch = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("x86") => "x86",
+        Ok("aarch64") => "arm64",
+        _ => "x64",
+    };
+
+    let kits_bin = Path::new(r"C:\Program Files (x86)\Windows Kits\10\bin");
+    if let Ok(entries) = std::fs::read_dir(kits_bin) {
+        let mut versions: Vec<(Vec<u32>, PathBuf)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                if !p.is_dir() {
+                    return None;
+                }
+                let name = e.file_name().to_string_lossy().to_string();
+                let parsed: Vec<u32> = name
+                    .split('.')
+                    .filter_map(|seg| seg.parse::<u32>().ok())
+                    .collect();
+                if parsed.is_empty() {
+                    return None;
+                }
+                let rc = p.join(arch).join("rc.exe");
+                rc.exists().then_some((parsed, rc))
+            })
+            .collect();
+        versions.sort_by(|a, b| b.0.cmp(&a.0));
+        if let Some((_, best)) = versions.into_iter().next() {
+            return Some(best);
+        }
+    }
+
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join("rc.exe");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=assets/winshred.ico");
     println!("cargo:rerun-if-changed=resources/app.rc");
     println!("cargo:rerun-if-changed=resources/app.manifest");
-    println!("cargo:rerun-if-changed=../winshred_shell/target/release/winshred_shell.dll");
+    println!("cargo:rerun-if-changed=winshred_shell/target/release/winshred_shell.dll");
     println!("cargo:rerun-if-changed=packaging/winshred.msix");
     println!("cargo:rerun-if-changed=packaging/winshred.cer");
     println!("cargo:rerun-if-changed=LICENSE");
 
-    let rc_candidates = [
-        r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\rc.exe",
-        r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\rc.exe",
-        r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\rc.exe",
-    ];
+    let Some(rc_exe) = find_rc_exe() else {
+        println!(
+            "cargo:warning=Windows SDK rc.exe nicht gefunden – Icon und Manifest werden nicht eingebettet."
+        );
+        return;
+    };
 
-    let rc_path = rc_candidates.iter().find(|p| std::path::Path::new(p).exists());
+    if let Ok(out_dir) = std::env::var("OUT_DIR") {
+        let res_path = format!("{}/app.res", out_dir);
+        let status = std::process::Command::new(&rc_exe)
+            .args(["/fo", &res_path, "resources/app.rc"])
+            .status();
 
-    if let Some(&rc_exe) = rc_path {
-        if let Ok(out_dir) = std::env::var("OUT_DIR") {
-            let res_path = format!("{}/app.res", out_dir);
-            let status = std::process::Command::new(rc_exe)
-                .args(["/fo", &res_path, "resources/app.rc"])
-                .status();
-
-            if let Ok(s) = status {
-                if s.success() {
-                    println!("cargo:rustc-link-arg={}", res_path);
-                }
+        match status {
+            Ok(s) if s.success() => {
+                println!("cargo:rustc-link-arg={}", res_path);
+            }
+            Ok(s) => {
+                println!(
+                    "cargo:warning=rc.exe ({:?}) fehlgeschlagen mit Status {:?}",
+                    rc_exe,
+                    s.code()
+                );
+            }
+            Err(e) => {
+                println!("cargo:warning=rc.exe ({:?}) konnte nicht gestartet werden: {}", rc_exe, e);
             }
         }
     }

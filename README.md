@@ -65,11 +65,11 @@ winshred/
    - Enthält intern die vorkompilierte Shell-DLL, das MSIX Sparse-Paket, Zertifikate und Icons.
 2. **Setup-Assistent (Wizard97-Stil)**:
    - Doppelklick auf `winshred.exe` öffnet den Assistenten für Neuinstallation, Reparatur oder Deinstallation.
-3. **Forensische Vernichtungs-Engine (DoD 5220.22-M)**:
-   - 3-faches Überschreiben (0x00, 0xFF, kryptografischer Zufall via Win32 BCrypt).
-   - Cluster-Slack-Bereinigung & Ausnullen von Alternate Data Streams (ADS).
+3. **Forensische Vernichtungs-Engine (Hybrid: DoD 5220.22-M / NIST SP 800-88)**:
+   - HDD: 3-faches Überschreiben nach DoD 5220.22-M (0x00, 0xFF, kryptografischer Zufall via Win32 BCrypt); SSD/NVMe & residente MFT-Dateien: flash-schonendes 1-Pass-Wiping.
+   - Cluster-Slack-Bereinigung & Überschreiben von Alternate Data Streams (ADS).
    - SSD/NVMe TRIM Deallocate-Signal zur Controller-Tilgung.
-   - Mehrfache Namens-Anonymisierung im NTFS MFT-Dateisystem.
+   - Umbenennen auf einen zufälligen Dateinamen im NTFS-Dateisystem vor der Löschung.
 4. **Windows 11 Integration**:
    - Modernes Windows 11 Kontextmenü direkt auf oberster Ebene.
    - Windows Explorer *"Senden an"* (SendTo) Kontextmenü.

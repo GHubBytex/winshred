@@ -9,7 +9,7 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -415,6 +415,24 @@ unsafe extern "system" {
 
     fn GetLastError() -> u32;
     fn GetCurrentThreadId() -> u32;
+    fn AttachConsole(dwProcessId: u32) -> i32;
+    fn GetStdHandle(nStdHandle: u32) -> *mut c_void;
+}
+
+const ATTACH_PARENT_PROCESS: u32 = 0xFFFFFFFF;
+const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+const STD_ERROR_HANDLE: u32 = (-12i32) as u32;
+
+fn attach_parent_console_if_available() -> bool {
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) != 0 {
+            return true;
+        }
+        let out = GetStdHandle(STD_OUTPUT_HANDLE);
+        let err = GetStdHandle(STD_ERROR_HANDLE);
+        (!out.is_null() && out != INVALID_HANDLE_VALUE)
+            || (!err.is_null() && err != INVALID_HANDLE_VALUE)
+    }
 }
 
 const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D1400;
@@ -479,6 +497,7 @@ const REG_DWORD: u32 = 4;
 const FSCTL_FILE_LEVEL_TRIM: u32 = 0x00098208;
 
 const HWND_TOPMOST: *mut c_void = -1isize as *mut c_void;
+const HWND_NOTOPMOST: *mut c_void = -2isize as *mut c_void;
 const SWP_NOSIZE: u32 = 0x0001;
 const SWP_NOMOVE: u32 = 0x0002;
 const SWP_SHOWWINDOW: u32 = 0x0040;
@@ -493,6 +512,12 @@ fn path_to_wide(path: &Path) -> Vec<u16> {
 }
 
 pub unsafe fn force_foreground_window(hwnd: *mut c_void) {
+    unsafe {
+        force_foreground_window_with_topmost(hwnd, true);
+    }
+}
+
+pub unsafe fn force_foreground_window_with_topmost(hwnd: *mut c_void, keep_topmost: bool) {
     if hwnd.is_null() {
         return;
     }
@@ -503,7 +528,7 @@ pub unsafe fn force_foreground_window(hwnd: *mut c_void) {
         ShowWindow(hwnd, 1 /* SW_SHOWNORMAL */);
         UpdateWindow(hwnd);
 
-        // 1. Z-Order auf HWND_TOPMOST setzen und anzeigen
+        // 1. Z-Order kurzzeitig auf HWND_TOPMOST setzen und anzeigen, um Window-Focus durchzusetzen
         SetWindowPos(
             hwnd,
             HWND_TOPMOST,
@@ -539,10 +564,10 @@ pub unsafe fn force_foreground_window(hwnd: *mut c_void) {
         SetActiveWindow(hwnd);
         SetFocus(hwnd);
 
-        // 4. HWND_TOPMOST bekräftigen
+        // 4. Endgültige Z-Order setzen (Topmost beibehalten oder wieder freigeben)
         SetWindowPos(
             hwnd,
-            HWND_TOPMOST,
+            if keep_topmost { HWND_TOPMOST } else { HWND_NOTOPMOST },
             0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
         );
@@ -1800,6 +1825,64 @@ pub fn shred_file(path: &Path, num_passes: usize) -> io::Result<()> {
     shred_file_with_reporter(path, num_passes, &mut NoopShredReporter)
 }
 
+fn compute_non_resident_wipe_len(path: &Path, file: &fs::File, len: u64) -> u64 {
+    // Ermittle reale physische Cluster-Belegung (AllocationSize)
+    let mut std_info = FILE_STANDARD_INFO {
+        allocation_size: 0,
+        end_of_file: 0,
+        number_of_links: 0,
+        delete_pending: 0,
+        directory: 0,
+    };
+    let ret = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FILE_STANDARD_INFO_CLASS,
+            &mut std_info as *mut _ as *mut c_void,
+            std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    if ret != 0 && std_info.allocation_size > 0 {
+        std_info.allocation_size as u64
+    } else {
+        let cluster_size = get_cluster_size(path);
+        let remainder = len % cluster_size;
+        if remainder != 0 {
+            len + (cluster_size - remainder)
+        } else {
+            len
+        }
+    }
+}
+
+fn estimate_file_wipe_bytes(path: &Path, logical_len: u64, num_passes: usize, is_ssd: bool) -> u64 {
+    if logical_len == 0 {
+        return 0;
+    }
+    if let Ok(file) = OpenOptions::new().read(true).open(path) {
+        let is_resident = is_file_resident_in_mft(&file, logical_len);
+        let effective_passes = if is_ssd || is_resident {
+            1
+        } else {
+            num_passes.max(1)
+        };
+        if !is_resident && is_sparse_file(path) {
+            if let Ok(ranges) = query_allocated_ranges(&file, logical_len) {
+                let range_bytes: u64 = ranges.iter().map(|&(_, l)| l).sum();
+                return range_bytes * effective_passes as u64;
+            }
+        }
+        let wipe_len = if is_resident {
+            logical_len
+        } else {
+            compute_non_resident_wipe_len(path, &file, logical_len)
+        };
+        return wipe_len * effective_passes as u64;
+    }
+    let effective_passes = if is_ssd { 1 } else { num_passes.max(1) };
+    logical_len * effective_passes as u64
+}
+
 pub fn shred_file_with_reporter<R: ShredReporter>(
     path: &Path,
     num_passes: usize,
@@ -1848,33 +1931,7 @@ pub fn shred_file_with_reporter<R: ShredReporter>(
                 // Exakt die Nutzdatenlaenge in-place ueberschreiben, damit keine Cluster ausgelagert werden.
                 len
             } else {
-                // Ermittle reale physische Cluster-Belegung (AllocationSize)
-                let mut std_info = FILE_STANDARD_INFO {
-                    allocation_size: 0,
-                    end_of_file: 0,
-                    number_of_links: 0,
-                    delete_pending: 0,
-                    directory: 0,
-                };
-                let ret = unsafe {
-                    GetFileInformationByHandleEx(
-                        file.as_raw_handle(),
-                        FILE_STANDARD_INFO_CLASS,
-                        &mut std_info as *mut _ as *mut c_void,
-                        std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
-                    )
-                };
-                if ret != 0 && std_info.allocation_size > 0 {
-                    std_info.allocation_size as u64
-                } else {
-                    let cluster_size = get_cluster_size(path);
-                    let remainder = len % cluster_size;
-                    if remainder != 0 {
-                        len + (cluster_size - remainder)
-                    } else {
-                        len
-                    }
-                }
+                compute_non_resident_wipe_len(path, &file, len)
             };
 
             wipe_open_file_with_reporter(
@@ -2098,20 +2155,89 @@ fn restart_explorer() {
     }
 }
 
-fn run_reg(args: &[&str]) {
-    let _ = Command::new("reg")
+static PENDING_SELF_DELETE: AtomicBool = AtomicBool::new(false);
+
+fn reg_key_exists(key: &str) -> bool {
+    Command::new("reg")
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .args(args)
-        .output();
+        .args(["query", key])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
-fn run_install_backend(opt_modern: bool, opt_classic: bool, opt_sendto: bool) -> Result<String, String> {
-    let install_dir = PathBuf::from("C:\\Program Files\\WinShred");
-    if let Err(e) = fs::create_dir_all(&install_dir) {
-        return Err(format!("Fehler beim Erstellen des Installationsordners:\n{}", e));
-    }
+fn is_classic_menu_installed() -> bool {
+    reg_key_exists(r"HKLM\SOFTWARE\Classes\*\shell\WinShred")
+        || reg_key_exists(r"HKCU\Software\Classes\*\shell\WinShred")
+}
 
-    // 1. Zuerst Explorer und verwaiste WinShred-Surrogate stoppen, damit DLL nicht schreibgeschützt gesperrt ist
+fn is_sendto_installed() -> bool {
+    env::var("APPDATA")
+        .map(|appdata| {
+            PathBuf::from(appdata)
+                .join(r"Microsoft\Windows\SendTo\WinShred (Sicher vernichten).lnk")
+                .exists()
+        })
+        .unwrap_or(false)
+}
+
+fn is_modern_package_installed() -> bool {
+    Command::new("powershell")
+        .creation_flags(0x08000000)
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "if (Get-AppxPackage -Name 'WinShred.ShellExtension' -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }",
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn run_reg(args: &[&str]) -> Result<(), String> {
+    let output = Command::new("reg")
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .args(args)
+        .output()
+        .map_err(|e| format!("reg konnte nicht gestartet werden ({:?}): {}", args, e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(format!("Registrierungsbefehl {:?} fehlgeschlagen: {}", args, detail));
+    }
+    Ok(())
+}
+
+fn delete_reg_key_if_exists(key: &str) -> Result<(), String> {
+    if reg_key_exists(key) {
+        run_reg(&["delete", key, "/f"])?;
+    }
+    Ok(())
+}
+
+fn schedule_self_delete_on_exit() {
+    if !PENDING_SELF_DELETE.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let install_dir = PathBuf::from(r"C:\Program Files\WinShred");
+    let exe_path = install_dir.join("winshred.exe");
+    let cmd_cleanup = format!(
+        "for /L %i in (1,1,30) do (del /f /q \"{}\" >nul 2>&1 & if not exist \"{}\" (rmdir \"{}\" >nul 2>&1 & exit) & ping -n 1 -w 300 127.0.0.1 >nul)",
+        exe_path.to_string_lossy(),
+        exe_path.to_string_lossy(),
+        install_dir.to_string_lossy(),
+    );
+    let _ = Command::new("cmd")
+        .current_dir(env::temp_dir())
+        .creation_flags(0x08000000)
+        .args(["/c", &cmd_cleanup])
+        .spawn();
+}
+
+fn stop_shell_hosts() {
     let _ = Command::new("powershell")
         .creation_flags(0x08000000)
         .args([
@@ -2123,118 +2249,161 @@ fn run_install_backend(opt_modern: bool, opt_classic: bool, opt_sendto: bool) ->
              Get-CimInstance Win32_Process -Filter \"Name = 'dllhost.exe'\" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*8a76b81c-0a87-4348-9f7c-79f8815e7c81*' } | Stop-Process -Force -ErrorAction SilentlyContinue;",
         ])
         .output();
+}
 
-    // 2. Eigene EXE nach Program Files kopieren
-    if let Ok(current_exe) = env::current_exe() {
+fn run_install_backend(opt_modern: bool, opt_classic: bool, opt_sendto: bool) -> Result<String, String> {
+    let install_dir = PathBuf::from("C:\\Program Files\\WinShred");
+    if let Err(e) = fs::create_dir_all(&install_dir) {
+        return Err(format!("Fehler beim Erstellen des Installationsordners:\n{}", e));
+    }
+
+    // 1. Zuerst Explorer und verwaiste WinShred-Surrogate stoppen, damit DLL nicht schreibgeschützt gesperrt ist
+    stop_shell_hosts();
+
+    // Alles Weitere in einem Hilfsblock ausführen, damit Explorer am Ende garantiert wieder gestartet wird
+    let install_result: Result<String, String> = (|| {
+        // 2. Eigene EXE nach Program Files kopieren (mit kurzem Retry falls Ziel noch freigegeben wird)
         let target_exe = install_dir.join("winshred.exe");
-        if current_exe != target_exe {
-            let _ = fs::copy(&current_exe, &target_exe);
+        if let Ok(current_exe) = env::current_exe() {
+            let same_exe = current_exe.to_string_lossy().to_ascii_lowercase()
+                == target_exe.to_string_lossy().to_ascii_lowercase();
+            if !same_exe {
+                let mut copy_err = None;
+                for _ in 0..5 {
+                    match fs::copy(&current_exe, &target_exe) {
+                        Ok(_) => {
+                            copy_err = None;
+                            break;
+                        }
+                        Err(e) => {
+                            copy_err = Some(e);
+                            std::thread::sleep(std::time::Duration::from_millis(150));
+                        }
+                    }
+                }
+                if let Some(e) = copy_err {
+                    return Err(format!("Fehler beim Kopieren von winshred.exe:\n{}", e));
+                }
+            }
         }
-    }
 
-    // 3. Eingebettete Shell-DLL, MSIX, Zertifikat und Icon ablegen (mit Retry bei sperrenden Handles)
-    let dll_path = install_dir.join("winshred_shell.dll");
-    let msix_path = install_dir.join("winshred.msix");
-    let cer_path = install_dir.join("winshred.cer");
-    let ico_path = install_dir.join("winshred.ico");
-    let lic_path = install_dir.join("LICENSE.txt");
+        // 3. Eingebettete Shell-DLL, MSIX, Zertifikat und Icon ablegen (mit Retry bei sperrenden Handles)
+        let dll_path = install_dir.join("winshred_shell.dll");
+        let msix_path = install_dir.join("winshred.msix");
+        let cer_path = install_dir.join("winshred.cer");
+        let ico_path = install_dir.join("winshred.ico");
+        let lic_path = install_dir.join("LICENSE.txt");
 
-    let mut write_dll_ok = false;
-    for _ in 0..5 {
-        if fs::write(&dll_path, SHELL_DLL_BYTES).is_ok() {
-            write_dll_ok = true;
-            break;
+        let mut dll_err = None;
+        for _ in 0..8 {
+            match fs::write(&dll_path, SHELL_DLL_BYTES) {
+                Ok(_) => {
+                    dll_err = None;
+                    break;
+                }
+                Err(e) => {
+                    dll_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+            }
         }
-        std::thread::sleep(std::time::Duration::from_millis(150));
-    }
-    if !write_dll_ok {
-        let _ = fs::write(&dll_path, SHELL_DLL_BYTES);
-    }
-    let _ = fs::write(&msix_path, MSIX_BYTES);
-    let _ = fs::write(&cer_path, CER_BYTES);
-    let _ = fs::write(&ico_path, ICO_BYTES);
-    let _ = fs::write(&lic_path, LICENSE_TEXT);
+        if let Some(e) = dll_err {
+            return Err(format!("Fehler beim Schreiben von winshred_shell.dll:\n{}", e));
+        }
 
-    // 4. Modernes Kontextmenue (Sparse Package) je nach Auswahl
-    let mut ps_command = String::from("$ProgressPreference = 'SilentlyContinue'; ");
-    if opt_modern {
-        ps_command.push_str(&format!(
-            "Import-Certificate -FilePath '{cer}' -CertStoreLocation 'Cert:\\LocalMachine\\TrustedPeople' | Out-Null; \
-            $pkg = Get-AppxPackage -Name 'WinShred.ShellExtension' -ErrorAction SilentlyContinue; \
-            if ($pkg) {{ Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction SilentlyContinue }}; \
-            try {{ \
-                Add-AppxPackage -Path '{msix}' -ExternalLocation '{inst}' -ErrorAction Stop; \
-            }} catch {{ \
-                [Console]::Error.WriteLine($_.Exception.Message); \
-            }} \
-            $verify = Get-AppxPackage -Name 'WinShred.ShellExtension' -ErrorAction SilentlyContinue; \
-            if (-not $verify) {{ [Console]::Error.WriteLine('Windows 11 Sparse-Package konnte nicht registriert werden. Stellen Sie sicher, dass Sideloading/Entwicklermodus erlaubt ist.'); }} ",
-            cer = cer_path.to_string_lossy(),
-            msix = msix_path.to_string_lossy(),
-            inst = install_dir.to_string_lossy()
-        ));
-    } else {
-        ps_command.push_str(
-            "$pkg = Get-AppxPackage -Name 'WinShred.ShellExtension' -ErrorAction SilentlyContinue; \
-            if ($pkg) { Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction SilentlyContinue }; "
-        );
-    }
+        fs::write(&msix_path, MSIX_BYTES)
+            .map_err(|e| format!("Fehler beim Schreiben von winshred.msix:\n{}", e))?;
+        fs::write(&cer_path, CER_BYTES)
+            .map_err(|e| format!("Fehler beim Schreiben von winshred.cer:\n{}", e))?;
+        fs::write(&ico_path, ICO_BYTES)
+            .map_err(|e| format!("Fehler beim Schreiben von winshred.ico:\n{}", e))?;
+        fs::write(&lic_path, LICENSE_TEXT)
+            .map_err(|e| format!("Fehler beim Schreiben von LICENSE.txt:\n{}", e))?;
 
-    // 5. SendTo Shortcut je nach Auswahl
-    if opt_sendto {
-        ps_command.push_str(&format!(
-            "$wsh = New-Object -ComObject WScript.Shell; \
-            $s = $wsh.CreateShortcut(\"$env:APPDATA\\Microsoft\\Windows\\SendTo\\WinShred (Sicher vernichten).lnk\"); \
-            $s.TargetPath = '{inst}\\winshred.exe'; \
-            $s.IconLocation = '{ico}'; \
-            $s.Save(); ",
-            inst = install_dir.to_string_lossy(),
-            ico = ico_path.to_string_lossy()
-        ));
-    } else {
-        if let Ok(appdata) = env::var("APPDATA") {
+        // 4. Modernes Kontextmenue (Sparse Package) je nach Auswahl
+        let mut ps_command = String::from("$ProgressPreference = 'SilentlyContinue'; ");
+        if opt_modern {
+            ps_command.push_str(&format!(
+                "Import-Certificate -FilePath '{cer}' -CertStoreLocation 'Cert:\\LocalMachine\\TrustedPeople' -ErrorAction Stop | Out-Null; \
+                $pkg = Get-AppxPackage -Name 'WinShred.ShellExtension' -ErrorAction SilentlyContinue; \
+                if ($pkg) {{ Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction SilentlyContinue }}; \
+                try {{ \
+                    Add-AppxPackage -Path '{msix}' -ExternalLocation '{inst}' -ErrorAction Stop; \
+                }} catch {{ \
+                    [Console]::Error.WriteLine($_.Exception.Message); \
+                }} \
+                $verify = Get-AppxPackage -Name 'WinShred.ShellExtension' -ErrorAction SilentlyContinue; \
+                if (-not $verify) {{ [Console]::Error.WriteLine('Windows 11 Sparse-Package konnte nicht registriert werden. Stellen Sie sicher, dass Sideloading/Entwicklermodus erlaubt ist.'); }} ",
+                cer = cer_path.to_string_lossy(),
+                msix = msix_path.to_string_lossy(),
+                inst = install_dir.to_string_lossy()
+            ));
+        } else {
+            ps_command.push_str(
+                "$pkg = Get-AppxPackage -Name 'WinShred.ShellExtension' -ErrorAction SilentlyContinue; \
+                if ($pkg) { Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction SilentlyContinue }; "
+            );
+        }
+
+        // 5. SendTo Shortcut je nach Auswahl
+        if opt_sendto {
+            ps_command.push_str(&format!(
+                "try {{ \
+                    $wsh = New-Object -ComObject WScript.Shell; \
+                    $s = $wsh.CreateShortcut(\"$env:APPDATA\\Microsoft\\Windows\\SendTo\\WinShred (Sicher vernichten).lnk\"); \
+                    $s.TargetPath = '{inst}\\winshred.exe'; \
+                    $s.IconLocation = '{ico}'; \
+                    $s.Save(); \
+                }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); }} ",
+                inst = install_dir.to_string_lossy(),
+                ico = ico_path.to_string_lossy()
+            ));
+        } else if let Ok(appdata) = env::var("APPDATA") {
             let lnk = PathBuf::from(appdata).join(r"Microsoft\Windows\SendTo\WinShred (Sicher vernichten).lnk");
-            let _ = fs::remove_file(lnk);
+            if lnk.exists() {
+                fs::remove_file(&lnk)
+                    .map_err(|e| format!("Fehler beim Entfernen der SendTo-Verknuepfung:\n{}", e))?;
+            }
         }
-    }
 
-    let output = Command::new("powershell")
-        .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_command])
-        .output();
+        let output = Command::new("powershell")
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_command])
+            .output()
+            .map_err(|e| format!("PowerShell konnte nicht gestartet werden:\n{}", e))?;
 
-    // 6. Klassisches Menue (statische Registry-Keys)
-    let ico_str = ico_path.to_string_lossy().to_string();
-    let cmd_str = format!("\"{}\" \"%1\"", install_dir.join("winshred.exe").to_string_lossy());
+        let ps_err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !ps_err.is_empty() {
+            return Err(ps_err);
+        }
+        if !output.status.success() {
+            return Err(format!("PowerShell-Konfiguration fehlgeschlagen (Exit-Code {:?}).", output.status.code()));
+        }
 
-    if opt_classic {
-        run_reg(&["add", r"HKLM\SOFTWARE\Classes\*\shell\WinShred", "/ve", "/d", "Mit WinShred sicher vernichten", "/f"]);
-        run_reg(&["add", r"HKLM\SOFTWARE\Classes\*\shell\WinShred", "/v", "Icon", "/d", &ico_str, "/f"]);
-        run_reg(&["add", r"HKLM\SOFTWARE\Classes\*\shell\WinShred\command", "/ve", "/d", &cmd_str, "/f"]);
+        // 6. Klassisches Menue (statische Registry-Keys)
+        let ico_str = ico_path.to_string_lossy().to_string();
+        let cmd_str = format!("\"{}\" \"%1\"", target_exe.to_string_lossy());
 
-        run_reg(&["add", r"HKLM\SOFTWARE\Classes\Directory\shell\WinShred", "/ve", "/d", "Mit WinShred sicher vernichten", "/f"]);
-        run_reg(&["add", r"HKLM\SOFTWARE\Classes\Directory\shell\WinShred", "/v", "Icon", "/d", &ico_str, "/f"]);
-        run_reg(&["add", r"HKLM\SOFTWARE\Classes\Directory\shell\WinShred\command", "/ve", "/d", &cmd_str, "/f"]);
-    } else {
-        run_reg(&["delete", r"HKLM\SOFTWARE\Classes\*\shell\WinShred", "/f"]);
-        run_reg(&["delete", r"HKLM\SOFTWARE\Classes\Directory\shell\WinShred", "/f"]);
-        run_reg(&["delete", r"HKCU\Software\Classes\*\shell\WinShred", "/f"]);
-        run_reg(&["delete", r"HKCU\Software\Classes\Directory\shell\WinShred", "/f"]);
-    }
+        if opt_classic {
+            run_reg(&["add", r"HKLM\SOFTWARE\Classes\*\shell\WinShred", "/ve", "/d", "Mit WinShred sicher vernichten", "/f"])?;
+            run_reg(&["add", r"HKLM\SOFTWARE\Classes\*\shell\WinShred", "/v", "Icon", "/d", &ico_str, "/f"])?;
+            run_reg(&["add", r"HKLM\SOFTWARE\Classes\*\shell\WinShred\command", "/ve", "/d", &cmd_str, "/f"])?;
 
-    // 7. Explorer sauber und entkoppelt über die Windows Shell neu starten
-    restart_explorer();
+            run_reg(&["add", r"HKLM\SOFTWARE\Classes\Directory\shell\WinShred", "/ve", "/d", "Mit WinShred sicher vernichten", "/f"])?;
+            run_reg(&["add", r"HKLM\SOFTWARE\Classes\Directory\shell\WinShred", "/v", "Icon", "/d", &ico_str, "/f"])?;
+            run_reg(&["add", r"HKLM\SOFTWARE\Classes\Directory\shell\WinShred\command", "/ve", "/d", &cmd_str, "/f"])?;
+        } else {
+            delete_reg_key_if_exists(r"HKLM\SOFTWARE\Classes\*\shell\WinShred")?;
+            delete_reg_key_if_exists(r"HKLM\SOFTWARE\Classes\Directory\shell\WinShred")?;
+            delete_reg_key_if_exists(r"HKCU\Software\Classes\*\shell\WinShred")?;
+            delete_reg_key_if_exists(r"HKCU\Software\Classes\Directory\shell\WinShred")?;
+        }
 
-    // 8. Verifikation
-    let files_exist = install_dir.join("winshred.exe").exists()
-        && install_dir.join("winshred_shell.dll").exists();
+        // 7. Verifikation
+        if !target_exe.exists() || !dll_path.exists() {
+            return Err(String::from("Installationsdateien sind nach dem Kopieren nicht vorhanden."));
+        }
 
-    let ps_err = output
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
-        .unwrap_or_default();
-
-    if files_exist && ps_err.is_empty() {
         let mut msg = String::from("Status: WinShred-Konfiguration abgeschlossen\n\nAUSGEWAEHLTE INTEGRATION:\n");
         if opt_modern {
             msg.push_str("[OK] Modernes Windows 11 Menue: Aktiv (\"Mit WinShred sicher vernichten\")\n");
@@ -2252,80 +2421,134 @@ fn run_install_backend(opt_modern: bool, opt_classic: bool, opt_sendto: bool) ->
             msg.push_str("[--] Explorer 'Senden an' (SendTo): Nicht eingerichtet\n");
         }
         msg.push_str("\nSICHERHEITS-FUNKTIONEN:\n");
-        msg.push_str("[OK] 3-Pass DoD 5220.22-M Krypto-Ueberschreibung (0x00, 0xFF, CSPRNG)\n");
+        msg.push_str("[OK] HDD: 3-Pass DoD 5220.22-M / SSD & NVMe: 1-Pass + TRIM\n");
         msg.push_str("[OK] Cluster-Slack-Bereinigung & Alternate Data Streams (ADS)\n");
-        msg.push_str("[OK] SSD/NVMe TRIM Deallocate Controller-Tilgung\n");
         msg.push_str("[OK] MFT-Dateinamen-Anonymisierung im NTFS-Dateisystem\n");
         msg.push_str("[OK] Schutz vor Symlink-/Junction-Traversierung & Systemverzeichnissen");
 
         Ok(msg)
-    } else if !ps_err.is_empty() {
-        Err(ps_err)
-    } else {
-        Err(String::from("Dateien konnten nicht angelegt werden."))
-    }
+    })();
+
+    // 8. Explorer sauber und entkoppelt über die Windows Shell neu starten (auch im Fehlerfall)
+    restart_explorer();
+
+    install_result
 }
 
 fn run_uninstall_backend() -> Result<(), String> {
-    // 1. PowerShell: Explorer stoppen, AppX-Paket und Zertifikat löschen
+    let mut errors: Vec<String> = Vec::new();
+
+    // 1. PowerShell: Explorer & dllhost stoppen, AppX-Paket und Zertifikat löschen
     let ps_command = "\
         $ProgressPreference = 'SilentlyContinue'; \
         Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue; \
         Get-CimInstance Win32_Process -Filter \"Name = 'dllhost.exe'\" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*8a76b81c-0a87-4348-9f7c-79f8815e7c81*' } | Stop-Process -Force -ErrorAction SilentlyContinue; \
         $pkg = Get-AppxPackage -Name 'WinShred.ShellExtension' -ErrorAction SilentlyContinue; \
-        if ($pkg) { Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction SilentlyContinue }; \
-        Get-ChildItem Cert:\\LocalMachine\\TrustedPeople -ErrorAction SilentlyContinue | Where-Object { $_.Subject -match 'CN=WinShred' } | Remove-Item -Force -ErrorAction SilentlyContinue;";
+        if ($pkg) { Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction Stop }; \
+        Get-ChildItem Cert:\\LocalMachine\\TrustedPeople -ErrorAction SilentlyContinue | Where-Object { $_.Subject -match 'CN=WinShred' } | Remove-Item -Force -ErrorAction Stop;";
 
-    let _ = Command::new("powershell")
+    match Command::new("powershell")
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_command])
-        .output();
+        .output()
+    {
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            if !stderr.is_empty() {
+                errors.push(stderr);
+            } else if !out.status.success() {
+                errors.push(format!("AppX/Zertifikat-Entfernung fehlgeschlagen (Exit {:?}).", out.status.code()));
+            }
+        }
+        Err(e) => errors.push(format!("PowerShell konnte nicht gestartet werden: {}", e)),
+    }
 
     // 2. Registry säubern
-    run_reg(&["delete", r"HKLM\SOFTWARE\Classes\*\shell\WinShred", "/f"]);
-    run_reg(&["delete", r"HKLM\SOFTWARE\Classes\Directory\shell\WinShred", "/f"]);
-    run_reg(&["delete", r"HKCU\Software\Classes\*\shell\WinShred", "/f"]);
-    run_reg(&["delete", r"HKCU\Software\Classes\Directory\shell\WinShred", "/f"]);
-    run_reg(&["delete", r"HKCR\*\shell\WinShred", "/f"]);
-    run_reg(&["delete", r"HKCR\Directory\shell\WinShred", "/f"]);
-    run_reg(&["delete", r"HKCU\Software\WinShred", "/f"]);
+    for key in [
+        r"HKLM\SOFTWARE\Classes\*\shell\WinShred",
+        r"HKLM\SOFTWARE\Classes\Directory\shell\WinShred",
+        r"HKCU\Software\Classes\*\shell\WinShred",
+        r"HKCU\Software\Classes\Directory\shell\WinShred",
+        r"HKCR\*\shell\WinShred",
+        r"HKCR\Directory\shell\WinShred",
+        r"HKCU\Software\WinShred",
+    ] {
+        if let Err(e) = delete_reg_key_if_exists(key) {
+            errors.push(e);
+        }
+    }
 
     // 3. SendTo-Verknüpfung löschen
     if let Ok(appdata) = env::var("APPDATA") {
         let lnk = PathBuf::from(appdata).join(r"Microsoft\Windows\SendTo\WinShred (Sicher vernichten).lnk");
-        let _ = fs::remove_file(lnk);
-    }
-
-    // 4. Explorer sauber neu starten
-    restart_explorer();
-
-    // 5. Dateien aus Program Files entfernen
-    let install_dir = PathBuf::from("C:\\Program Files\\WinShred");
-    let _ = fs::remove_file(install_dir.join("winshred_shell.dll"));
-    let _ = fs::remove_file(install_dir.join("winshred.msix"));
-    let _ = fs::remove_file(install_dir.join("winshred.cer"));
-    let _ = fs::remove_file(install_dir.join("winshred.ico"));
-    let _ = fs::remove_file(install_dir.join("LICENSE.txt"));
-
-    if let Ok(current_exe) = env::current_exe() {
-        if !current_exe.starts_with(&install_dir) {
-            let _ = fs::remove_file(install_dir.join("winshred.exe"));
-            let _ = fs::remove_dir(&install_dir);
-        } else {
-            // Selbstlöschung bei Ausführung direkt aus Program Files
-            let cmd_cleanup = format!(
-                "ping 127.0.0.1 -n 2 >nul & del /f /q \"{}\" & rmdir \"{}\"",
-                install_dir.join("winshred.exe").to_string_lossy(),
-                install_dir.to_string_lossy()
-            );
-            let _ = Command::new("cmd")
-                .creation_flags(0x08000000)
-                .args(["/c", &cmd_cleanup])
-                .spawn();
+        if lnk.exists() {
+            if let Err(e) = fs::remove_file(&lnk) {
+                errors.push(format!("SendTo-Verknuepfung konnte nicht geloescht werden: {}", e));
+            }
         }
     }
 
-    Ok(())
+    // 4. Dateien aus Program Files entfernen BEVOR Explorer neu gestartet wird
+    // (verhindert, dass ein neu startender Explorer sofort Handles auf winshred_shell.dll zieht)
+    let install_dir = PathBuf::from("C:\\Program Files\\WinShred");
+    let dll_path = install_dir.join("winshred_shell.dll");
+    if dll_path.exists() {
+        let mut dll_del_err = None;
+        for _ in 0..8 {
+            match fs::remove_file(&dll_path) {
+                Ok(_) => {
+                    dll_del_err = None;
+                    break;
+                }
+                Err(e) => {
+                    dll_del_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+            }
+        }
+        if let Some(e) = dll_del_err {
+            errors.push(format!("winshred_shell.dll konnte nicht geloescht werden: {}", e));
+        }
+    }
+
+    for fname in ["winshred.msix", "winshred.cer", "winshred.ico", "LICENSE.txt"] {
+        let p = install_dir.join(fname);
+        if p.exists() {
+            if let Err(e) = fs::remove_file(&p) {
+                errors.push(format!("{} konnte nicht geloescht werden: {}", fname, e));
+            }
+        }
+    }
+
+    if let Ok(current_exe) = env::current_exe() {
+        let in_install_dir = current_exe
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .starts_with(&install_dir.to_string_lossy().to_ascii_lowercase());
+        if !in_install_dir {
+            let exe_path = install_dir.join("winshred.exe");
+            if exe_path.exists() {
+                if let Err(e) = fs::remove_file(&exe_path) {
+                    errors.push(format!("winshred.exe konnte nicht geloescht werden: {}", e));
+                }
+            }
+            if install_dir.exists() {
+                let _ = fs::remove_dir(&install_dir);
+            }
+        } else {
+            // Selbstlöschung erst nach sauberem Beenden des Prozesses anstoßen
+            PENDING_SELF_DELETE.store(true, Ordering::SeqCst);
+        }
+    }
+
+    // 5. Explorer sauber neu starten (auch bei Teilfehlern, damit der Desktop nutzbar bleibt)
+    restart_explorer();
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
 }
 
 // ==========================================
@@ -2574,6 +2797,13 @@ unsafe fn update_wizard_page(hwnd: *mut c_void) {
                 show_ctrl(CTRLS.btn_cancel, true);
                 EnableWindow(CTRLS.btn_cancel, 1);
                 show_ctrl(CTRLS.btn_finish, false);
+
+                SendMessageW(
+                    hwnd,
+                    DM_SETDEFID,
+                    if accepted { ID_BTN_NEXT } else { ID_BTN_CANCEL },
+                    0,
+                );
             }
             WizardPage::Config => {
                 set_lic_visible(false);
@@ -2584,6 +2814,7 @@ unsafe fn update_wizard_page(hwnd: *mut c_void) {
                     show_ctrl(CTRLS.btn_install, false);
                     show_ctrl(CTRLS.btn_next, true);
                     EnableWindow(CTRLS.btn_next, 1);
+                    SendMessageW(hwnd, DM_SETDEFID, ID_BTN_NEXT, 0);
                 } else {
                     set_p1_install_visible(true);
                     set_p1_manage_visible(false);
@@ -2592,6 +2823,7 @@ unsafe fn update_wizard_page(hwnd: *mut c_void) {
                     show_ctrl(CTRLS.btn_install, true);
                     EnableWindow(CTRLS.btn_install, 1);
                     show_ctrl(CTRLS.btn_next, false);
+                    SendMessageW(hwnd, DM_SETDEFID, ID_BTN_INSTALL, 0);
                 }
                 set_p2_progress_visible(false);
                 set_p3_finish_visible(false);
@@ -2615,6 +2847,7 @@ unsafe fn update_wizard_page(hwnd: *mut c_void) {
                 EnableWindow(CTRLS.btn_cancel, 0);
                 show_ctrl(CTRLS.btn_finish, false);
 
+                SendMessageW(hwnd, DM_SETDEFID, 0, 0);
                 SendMessageW(CTRLS.bar_p2_progress, PBM_SETMARQUEE, 1, 30);
             }
             WizardPage::Finish => {
@@ -2629,6 +2862,7 @@ unsafe fn update_wizard_page(hwnd: *mut c_void) {
                 show_ctrl(CTRLS.btn_next, false);
                 show_ctrl(CTRLS.btn_cancel, false);
                 show_ctrl(CTRLS.btn_finish, true);
+                SendMessageW(hwnd, DM_SETDEFID, ID_BTN_FINISH, 0);
                 SetFocus(CTRLS.btn_finish);
             }
         }
@@ -2688,8 +2922,10 @@ unsafe extern "system" fn installer_wnd_proc(
                 let id = wparam & 0xFFFF;
                 if id == ID_RAD_LIC_ACCEPT {
                     EnableWindow(CTRLS.btn_next, 1);
+                    SendMessageW(hwnd, DM_SETDEFID, ID_BTN_NEXT, 0);
                 } else if id == ID_RAD_LIC_DECLINE {
                     EnableWindow(CTRLS.btn_next, 0);
+                    SendMessageW(hwnd, DM_SETDEFID, ID_BTN_CANCEL, 0);
                 } else if id == ID_BTN_BACK {
                     if CURRENT_PAGE == WizardPage::Config && !IS_CURRENTLY_INSTALLED {
                         CURRENT_PAGE = WizardPage::License;
@@ -2712,7 +2948,9 @@ unsafe extern "system" fn installer_wnd_proc(
                 } else if id == ID_BTN_NEXT && CURRENT_PAGE == WizardPage::License {
                     CURRENT_PAGE = WizardPage::Config;
                     update_wizard_page(hwnd);
-                } else if id == ID_BTN_INSTALL || id == ID_BTN_NEXT {
+                } else if (id == ID_BTN_INSTALL && CURRENT_PAGE == WizardPage::Config && !IS_CURRENTLY_INSTALLED)
+                    || (id == ID_BTN_NEXT && CURRENT_PAGE == WizardPage::Config && IS_CURRENTLY_INSTALLED)
+                {
                     let opt_modern = SendMessageW(CTRLS.chk_p1_modern, BM_GETCHECK, 0, 0) != 0;
                     let opt_classic = SendMessageW(CTRLS.chk_p1_classic, BM_GETCHECK, 0, 0) != 0;
                     let opt_sendto = SendMessageW(CTRLS.chk_p1_sendto, BM_GETCHECK, 0, 0) != 0;
@@ -2742,7 +2980,13 @@ unsafe extern "system" fn installer_wnd_proc(
                             }
                         } else {
                             let (m, c, s) = if is_installed_now {
-                                (true, false, true)
+                                let cur_classic = is_classic_menu_installed();
+                                let mut cur_modern = is_modern_package_installed();
+                                let cur_sendto = is_sendto_installed();
+                                if !cur_modern && !cur_classic {
+                                    cur_modern = true;
+                                }
+                                (cur_modern, cur_classic, cur_sendto)
                             } else {
                                 (opt_modern, opt_classic, opt_sendto)
                             };
@@ -2768,7 +3012,10 @@ unsafe extern "system" fn installer_wnd_proc(
 
                         PostMessageW(hwnd_raw as *mut c_void, WM_APP_SETUP_DONE, 0, 0);
                     });
-                } else if id == ID_BTN_FINISH || id == ID_BTN_CANCEL {
+                } else if id == ID_BTN_FINISH
+                    || id == ID_BTN_CANCEL
+                    || (id == 2 /* IDCANCEL (Escape) */ && CURRENT_PAGE != WizardPage::Progress)
+                {
                     DestroyWindow(hwnd);
                 }
                 0
@@ -2853,9 +3100,9 @@ unsafe extern "system" fn installer_wnd_proc(
                 let rc_footer = RECT { left: 0, top: 336, right: 520, bottom: 390 };
                 FillRect(hdc, &rc_footer, H_BRUSH_DIALOG);
 
-                // Header-Icon (48x48) rechts oben
+                // Header-Icon (48x48) rechts oben (LR_SHARED verhindert HICON-Handle-Leak beim Repaint)
                 let h_mod = GetModuleHandleW(std::ptr::null());
-                let h_icon = LoadImageW(h_mod, 1 as *const u16, 1 /* IMAGE_ICON */, 48, 48, 0);
+                let h_icon = LoadImageW(h_mod, 1 as *const u16, 1 /* IMAGE_ICON */, 48, 48, LR_SHARED);
                 if !h_icon.is_null() {
                     DrawIconEx(hdc, 520 - 48 - 18, 9, h_icon, 48, 48, 0, std::ptr::null_mut(), 3);
                 }
@@ -2954,8 +3201,8 @@ fn show_installer_wizard() {
         wnd_class.lpfn_wnd_proc = Some(installer_wnd_proc);
         wnd_class.h_instance = instance;
         wnd_class.h_cursor = LoadCursorW(std::ptr::null_mut(), 32512 as *const u16);
-        wnd_class.h_icon = LoadImageW(instance, 1 as *const u16, 1, 32, 32, 0);
-        wnd_class.h_icon_sm = LoadImageW(instance, 1 as *const u16, 1, 16, 16, 0);
+        wnd_class.h_icon = LoadImageW(instance, 1 as *const u16, 1, 32, 32, LR_SHARED);
+        wnd_class.h_icon_sm = LoadImageW(instance, 1 as *const u16, 1, 16, 16, LR_SHARED);
         wnd_class.lpsz_class_name = class_name.as_ptr();
 
         RegisterClassExW(&wnd_class);
@@ -3078,7 +3325,7 @@ fn show_installer_wizard() {
         SendMessageW(CTRLS.chk_p1_sendto, BM_SETCHECK, BST_CHECKED, 0);
 
         CTRLS.chk_p1_dod = create_ctrl(
-            0, "BUTTON", "3-Pass DoD 5220.22-M Krypto-Ueberschreibung & SSD/NVMe TRIM",
+            0, "BUTTON", "HDD: 3-Pass DoD 5220.22-M / SSD & NVMe: 1-Pass + TRIM",
             WS_CHILD | BS_AUTOCHECKBOX | WS_DISABLED, 44, 280, 430, 20, hwnd, 0, H_FONT_REGULAR,
         );
         SendMessageW(CTRLS.chk_p1_dod, BM_SETCHECK, BST_CHECKED, 0);
@@ -3177,15 +3424,17 @@ fn show_installer_wizard() {
         // Erste Seite initialisieren
         update_wizard_page(hwnd);
 
-        force_foreground_window(hwnd);
+        force_foreground_window_with_topmost(hwnd, false);
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            if IsDialogMessageW(hwnd, &msg) == 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
 
-        // Aufraeumen
+        // Aufraeumen (inkl. Zurücksetzen der Handles, damit init_gui_resources danach neu erzeugen kann)
         DeleteObject(H_BRUSH_WHITE);
         DeleteObject(H_BRUSH_DIALOG);
         DeleteObject(H_BRUSH_LINE);
@@ -3194,6 +3443,14 @@ fn show_installer_wizard() {
         DeleteObject(H_FONT_BOLD);
         DeleteObject(H_FONT_REGULAR);
         DeleteObject(H_FONT_SUCCESS);
+        H_BRUSH_WHITE = std::ptr::null_mut();
+        H_BRUSH_DIALOG = std::ptr::null_mut();
+        H_BRUSH_LINE = std::ptr::null_mut();
+        H_FONT_TITLE = std::ptr::null_mut();
+        H_FONT_SUBTITLE = std::ptr::null_mut();
+        H_FONT_BOLD = std::ptr::null_mut();
+        H_FONT_REGULAR = std::ptr::null_mut();
+        H_FONT_SUCCESS = std::ptr::null_mut();
     }
 }
 
@@ -3441,6 +3698,7 @@ pub fn show_confirmation_dialog(
     paths: &[PathBuf],
     is_already_admin: bool,
     important_reasons: &[String],
+    num_passes: usize,
 ) -> (ConfirmationResult, bool) {
     unsafe {
         CONFIRMATION_CHOICE = ConfirmationResult::Cancel;
@@ -3513,12 +3771,25 @@ pub fn show_confirmation_dialog(
                 DriveMediaType::Unknown => (),
             }
         }
+        let hdd_owned_text;
         let media_text = if has_ssd && !has_hdd {
             "[SSD / NVMe erkannt] Flash-optimiertes 1-Pass Wiping + Hardware-TRIM aktiv"
         } else if has_hdd && !has_ssd {
-            "[HDD erkannt] 1-Pass Krypto-Zufall (NIST SP 800-88 / BSI konform)"
+            hdd_owned_text = if num_passes == 3 {
+                "[HDD erkannt] 3-Pass DoD 5220.22-M (0x00, 0xFF, Krypto-Zufall)".to_string()
+            } else if num_passes > 1 {
+                format!("[HDD erkannt] {}-Pass Ueberschreibung (DoD / Krypto-Zufall)", num_passes)
+            } else {
+                "[HDD erkannt] 1-Pass Krypto-Zufall (NIST SP 800-88 / BSI konform)".to_string()
+            };
+            &hdd_owned_text
         } else if has_ssd && has_hdd {
-            "[SSD & HDD erkannt] Medienspezifische Tilgung (TRIM / NIST) aktiv"
+            hdd_owned_text = if num_passes > 1 {
+                format!("[SSD & HDD erkannt] SSD: 1-Pass + TRIM / HDD: {}-Pass aktiv", num_passes)
+            } else {
+                "[SSD & HDD erkannt] Medienspezifische Tilgung (TRIM / NIST) aktiv".to_string()
+            };
+            &hdd_owned_text
         } else {
             "[Speicher erkannt] Sichere adaptive Vernichtung aktiv"
         };
@@ -4031,8 +4302,16 @@ pub fn shorten_path_display(path_str: &str, max_chars: usize) -> String {
 fn count_items_and_bytes(paths: &[PathBuf], num_passes: usize, cancel_flag: &AtomicBool) -> (usize, u64) {
     let mut total_items = 0;
     let mut total_bytes = 0;
+    let mut drive_ssd_cache: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
 
-    fn scan_item(path: &Path, items: &mut usize, bytes: &mut u64, num_passes: usize, cancel: &AtomicBool) {
+    fn scan_item(
+        path: &Path,
+        items: &mut usize,
+        bytes: &mut u64,
+        num_passes: usize,
+        cancel: &AtomicBool,
+        drive_ssd_cache: &mut std::collections::HashMap<String, bool>,
+    ) {
         if cancel.load(Ordering::SeqCst) || is_dangerous_or_root_path(path) {
             return;
         }
@@ -4050,22 +4329,30 @@ fn count_items_and_bytes(paths: &[PathBuf], num_passes: usize, cancel_flag: &Ato
                     if cancel.load(Ordering::SeqCst) {
                         return;
                     }
-                    scan_item(&entry.path(), items, bytes, num_passes, cancel);
+                    scan_item(&entry.path(), items, bytes, num_passes, cancel, drive_ssd_cache);
                 }
             }
         } else {
-            let media_type = get_drive_media_type(path);
-            let effective_passes = if matches!(media_type, DriveMediaType::SsdNvme { .. }) {
-                1
+            let is_ssd = if let Some(drive) = extract_drive_letter(path) {
+                *drive_ssd_cache.entry(drive).or_insert_with(|| {
+                    matches!(get_drive_media_type(path), DriveMediaType::SsdNvme { .. })
+                })
             } else {
-                num_passes.max(1)
+                matches!(get_drive_media_type(path), DriveMediaType::SsdNvme { .. })
             };
-            *bytes += sym_meta.len() * effective_passes as u64;
+            *bytes += estimate_file_wipe_bytes(path, sym_meta.len(), num_passes, is_ssd);
         }
     }
 
     for p in paths {
-        scan_item(p, &mut total_items, &mut total_bytes, num_passes, cancel_flag);
+        scan_item(
+            p,
+            &mut total_items,
+            &mut total_bytes,
+            num_passes,
+            cancel_flag,
+            &mut drive_ssd_cache,
+        );
     }
 
     (total_items, total_bytes)
@@ -4176,6 +4463,9 @@ unsafe extern "system" fn progress_dialog_wnd_proc(
                 0
             }
             WM_APP_PROGRESS_UPDATE => {
+                if PROG_CANCEL.load(Ordering::SeqCst) {
+                    return 0;
+                }
                 if let Ok(guard_opt) = PROG_SHARED.lock() {
                     if let Some(ref shared_arc) = *guard_opt {
                         if let Ok(guard) = shared_arc.lock() {
@@ -4276,6 +4566,9 @@ impl ShredReporter for GuiShredReporter {
     }
 
     fn on_bytes_written(&mut self, bytes: u64) {
+        if self.is_cancelled() {
+            return;
+        }
         self.accumulated_bytes += bytes;
         if self.last_ui_update.elapsed().as_millis() >= 30 || self.accumulated_bytes >= 1024 * 1024 {
             self.flush_updates();
@@ -4283,6 +4576,9 @@ impl ShredReporter for GuiShredReporter {
     }
 
     fn on_item_done(&mut self, _path: &Path, _is_dir: bool) {
+        if self.is_cancelled() {
+            return;
+        }
         self.pending_items += 1;
         if self.last_ui_update.elapsed().as_millis() >= 30 {
             self.flush_updates();
@@ -4292,6 +4588,9 @@ impl ShredReporter for GuiShredReporter {
 
 impl GuiShredReporter {
     fn flush_updates(&mut self) {
+        if self.is_cancelled() {
+            return;
+        }
         if let Ok(mut g) = self.shared.lock() {
             g.processed_bytes += self.accumulated_bytes;
             g.processed_items += self.pending_items;
@@ -4475,9 +4774,9 @@ pub fn show_shred_progress_dialog(
                     "Vernichtung wird gestartet...".to_string()
                 };
             }
-            PostMessageW(hwnd, WM_APP_PROGRESS_UPDATE, 0, 0);
-
-            if PROG_CANCEL.load(Ordering::SeqCst) {
+            if !PROG_CANCEL.load(Ordering::SeqCst) {
+                PostMessageW(hwnd, WM_APP_PROGRESS_UPDATE, 0, 0);
+            } else {
                 if let Ok(mut g) = shared_clone.lock() {
                     g.cancelled = true;
                     g.completed = true;
@@ -4547,8 +4846,10 @@ pub fn show_shred_progress_dialog(
                 }
             }
 
-            PostMessageW(hwnd, WM_APP_PROGRESS_UPDATE, 0, 0);
-            std::thread::sleep(std::time::Duration::from_millis(150));
+            if !cancelled {
+                PostMessageW(hwnd, WM_APP_PROGRESS_UPDATE, 0, 0);
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
             PostMessageW(hwnd, WM_APP_SHRED_DONE, 0, 0);
         });
 
@@ -4592,32 +4893,288 @@ pub fn show_shred_progress_dialog(
     }
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ParsedCliArgs {
+    install: bool,
+    uninstall: bool,
+    reset_prompts: bool,
+    show_help: bool,
+    auto_confirm: bool,
+    is_quiet: bool,
+    purge_journal: bool,
+    elevated_confirmed: bool,
+    custom_passes: Option<usize>,
+    filelists: Vec<PathBuf>,
+    raw_paths: Vec<PathBuf>,
+}
+
+fn parse_passes_value(val: &str) -> Result<usize, String> {
+    let n = val
+        .parse::<usize>()
+        .map_err(|_| format!("Ungueltiger Wert fuer --passes: '{}'", val))?;
+    if n == 0 {
+        return Err(String::from("Ungueltiger Wert fuer --passes: muss mindestens 1 sein."));
+    }
+    Ok(n)
+}
+
+fn parse_cli_args<I, S>(args: I) -> Result<ParsedCliArgs, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut parsed = ParsedCliArgs::default();
+    let mut iter = args.into_iter().map(|s| s.as_ref().to_string());
+    let mut end_of_options = false;
+
+    while let Some(arg) = iter.next() {
+        if end_of_options {
+            parsed.raw_paths.push(PathBuf::from(arg));
+            continue;
+        }
+        if arg == "--" {
+            end_of_options = true;
+            continue;
+        }
+        match arg.as_str() {
+            "--help" | "-h" | "/?" => parsed.show_help = true,
+            "--install" | "-i" => parsed.install = true,
+            "--uninstall" | "-u" => parsed.uninstall = true,
+            "--reset-prompts" => parsed.reset_prompts = true,
+            "--quiet" => {
+                parsed.auto_confirm = true;
+                parsed.is_quiet = true;
+            }
+            "-y" | "--yes" => parsed.auto_confirm = true,
+            "--admin" | "--admin-purge" => parsed.purge_journal = true,
+            "--elevated-confirmed" => {
+                parsed.elevated_confirmed = true;
+                parsed.purge_journal = true;
+            }
+            "--purge-journal" | "-p" => parsed.purge_journal = true,
+            "--passes" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| String::from("Option --passes erfordert eine Zahl (>= 1)."))?;
+                parsed.custom_passes = Some(parse_passes_value(&val)?);
+            }
+            "--filelist" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| String::from("Option --filelist erfordert einen Dateipfad."))?;
+                if val.trim().is_empty() {
+                    return Err(String::from("Option --filelist erfordert einen nicht-leeren Pfad."));
+                }
+                parsed.filelists.push(PathBuf::from(val));
+            }
+            _ => {
+                if let Some(val) = arg.strip_prefix("--passes=") {
+                    parsed.custom_passes = Some(parse_passes_value(val)?);
+                } else if let Some(val) = arg.strip_prefix("--filelist=") {
+                    if val.trim().is_empty() {
+                        return Err(String::from("Option --filelist erfordert einen nicht-leeren Pfad."));
+                    }
+                    parsed.filelists.push(PathBuf::from(val));
+                } else if arg.starts_with('-') {
+                    return Err(format!("Unbekanntes Argument: {}", arg));
+                } else {
+                    parsed.raw_paths.push(PathBuf::from(arg));
+                }
+            }
+        }
+    }
+
+    Ok(parsed)
+}
+
+fn read_paths_from_filelist(list_path: &Path, delete_after: bool) -> Result<Vec<PathBuf>, String> {
+    let content = fs::read_to_string(list_path)
+        .map_err(|e| format!("Dateiliste '{}' konnte nicht gelesen werden: {}", list_path.display(), e))?;
+    if delete_after {
+        let _ = fs::remove_file(list_path);
+    }
+    let mut paths = Vec::new();
+    for raw_line in content.lines() {
+        let clean = raw_line.trim_start_matches('\u{feff}').trim();
+        if !clean.is_empty() {
+            paths.push(PathBuf::from(clean));
+        }
+    }
+    Ok(paths)
+}
+
+static ELEVATE_LIST_SEQ: AtomicU32 = AtomicU32::new(1);
+
+fn relaunch_elevated_with_paths(valid_paths: &[PathBuf], custom_passes: Option<usize>) {
+    let mut parts = vec![
+        String::from("--admin"),
+        String::from("--elevated-confirmed"),
+    ];
+    if let Some(p_count) = custom_passes {
+        parts.push(String::from("--passes"));
+        parts.push(p_count.to_string());
+    }
+
+    let mut direct_parts = parts.clone();
+    for p in valid_paths {
+        direct_parts.push(quote_windows_cli_arg(&p.to_string_lossy()));
+    }
+    let joined_direct = direct_parts.join(" ");
+    let utf16_len: usize = joined_direct.encode_utf16().count();
+
+    if utf16_len <= 28_000 {
+        elevate_relaunch(&joined_direct);
+        return;
+    }
+
+    let seq = ELEVATE_LIST_SEQ.fetch_add(1, Ordering::Relaxed);
+    let list_path = env::temp_dir().join(format!("winshred_elev_{}_{}.lst", std::process::id(), seq));
+    let body = valid_paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if fs::write(&list_path, body).is_ok() {
+        parts.push(String::from("--filelist"));
+        parts.push(quote_windows_cli_arg(&list_path.to_string_lossy()));
+        elevate_relaunch(&parts.join(" "));
+    } else {
+        elevate_relaunch(&joined_direct);
+    }
+}
+
+fn cli_help_text() -> &'static str {
+    "WinShred - Sichere Datei- und Ordnervernichtung\n\n\
+Aufruf:\n\
+  winshred.exe                        Startet den Installations-/Verwaltungsassistenten\n\
+  winshred.exe [OPTIONEN] <PFADE...>  Vernichtet angegebene Dateien/Ordner sicher\n\n\
+Optionen:\n\
+  --install, -i         Installiert Kontextmenue (Modern + SendTo) im Hintergrund\n\
+  --uninstall, -u       Deinstalliert WinShred vollstaendig im Hintergrund\n\
+  --reset-prompts       Aktiviert die Sicherheitsabfrage vor dem Loeschen wieder\n\
+  --passes <N>          Anzahl der Ueberschreib-Durchgaenge fuer HDDs (Standard: 3, SSD immer 1)\n\
+  --filelist <DATEI>    Liest zu vernichtende Pfade zeilenweise aus UTF-8-Datei\n\
+  --admin, -p           Bereinigt zusaetzlich das NTFS USN-Journal ($UsnJrnl)\n\
+  --yes, -y             Ueberspringt die Sicherheitsabfrage (zeigt Fortschrittsdialog)\n\
+  --quiet               Headless-Ausfuehrung ohne GUI-Dialoge (mit -y)\n\
+  --help, -h            Zeigt diese Hilfe an"
+}
+
+fn report_cli_error(msg: &str, quiet: bool) {
+    let has_console = attach_parent_console_if_available();
+    eprintln!("[FEHLER] {}", msg);
+    if !quiet && !has_console {
+        show_message_box(
+            msg,
+            "WinShred - Fehler",
+            MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND,
+        );
+    }
+}
+
 // ==========================================
 // Entry Point (CLI / GUI / Kontextmenue)
 // ==========================================
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
 
-    // 1. Spezial-Flags fuer Headless CLI
-    if args.iter().any(|a| a == "--install" || a == "-i") {
+    // 1. Ohne Parameter gestartet (Doppelklick auf die EXE) -> Installer Wizard
+    if args.is_empty() {
+        let is_admin = unsafe { IsUserAnAdmin() } != 0;
+        if !is_admin {
+            elevate_relaunch("");
+            return;
+        }
+        show_installer_wizard();
+        schedule_self_delete_on_exit();
+        return;
+    }
+
+    // 2. Argumente streng parsen und validieren (#8 & #9)
+    let parsed = match parse_cli_args(&args) {
+        Ok(p) => p,
+        Err(err) => {
+            let is_quiet_arg = args.iter().any(|a| a == "--quiet");
+            report_cli_error(
+                &format!(
+                    "{}\n\nVerwenden Sie 'winshred.exe --help' fuer eine Uebersicht der Optionen.",
+                    err
+                ),
+                is_quiet_arg,
+            );
+            std::process::exit(1);
+        }
+    };
+
+    if parsed.show_help {
+        let has_console = attach_parent_console_if_available();
+        println!("{}", cli_help_text());
+        if !parsed.is_quiet && !has_console {
+            show_message_box(
+                cli_help_text(),
+                "WinShred - Hilfe",
+                MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND,
+            );
+        }
+        return;
+    }
+
+    // 3. Spezial-Flags fuer Headless CLI / Einstellungen
+    if parsed.install {
         let is_admin = unsafe { IsUserAnAdmin() } != 0;
         if !is_admin {
             elevate_relaunch("--install");
             return;
         }
-        let _ = run_install_backend(true, false, true);
+        let has_console = attach_parent_console_if_available();
+        match run_install_backend(true, false, true) {
+            Ok(msg) => {
+                println!("{}", msg);
+            }
+            Err(e) => {
+                eprintln!("[FEHLER] Installation fehlgeschlagen:\n{}", e);
+                if !has_console {
+                    show_message_box(
+                        &format!("Installation fehlgeschlagen:\n{}", e),
+                        "WinShred - Installationsfehler",
+                        MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND,
+                    );
+                }
+                std::process::exit(1);
+            }
+        }
         return;
     }
-    if args.iter().any(|a| a == "--uninstall" || a == "-u") {
+
+    if parsed.uninstall {
         let is_admin = unsafe { IsUserAnAdmin() } != 0;
         if !is_admin {
             elevate_relaunch("--uninstall");
             return;
         }
-        let _ = run_uninstall_backend();
+        let has_console = attach_parent_console_if_available();
+        let res = run_uninstall_backend();
+        schedule_self_delete_on_exit();
+        match res {
+            Ok(()) => {
+                println!("WinShred wurde vollstaendig deinstalliert.");
+            }
+            Err(e) => {
+                eprintln!("[FEHLER] Deinstallation fehlgeschlagen:\n{}", e);
+                if !has_console {
+                    show_message_box(
+                        &format!("Deinstallation fehlgeschlagen:\n{}", e),
+                        "WinShred - Deinstallationsfehler",
+                        MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND,
+                    );
+                }
+                std::process::exit(1);
+            }
+        }
         return;
     }
-    if args.iter().any(|a| a == "--reset-prompts") {
+
+    if parsed.reset_prompts {
         set_skip_safety_prompt(false);
         show_message_box(
             "Die Sicherheitsprüfung vor dem Vernichten wurde wieder aktiviert.",
@@ -4627,61 +5184,49 @@ fn main() {
         return;
     }
 
-    // 2. Ohne Parameter gestartet (Doppelklick auf die EXE) -> Installer Wizard
-    if args.is_empty() {
-        let is_admin = unsafe { IsUserAnAdmin() } != 0;
-        if !is_admin {
-            elevate_relaunch("");
-            return;
-        }
-        show_installer_wizard();
-        return;
+    // 4. Mit Dateipfaden gestartet -> Shredder-Modus
+    let auto_confirm = parsed.auto_confirm;
+    let is_quiet = parsed.is_quiet;
+    let mut purge_journal = parsed.purge_journal;
+    let elevated_confirmed = parsed.elevated_confirmed;
+    let custom_passes = parsed.custom_passes;
+
+    if is_quiet {
+        attach_parent_console_if_available();
     }
 
-    // 3. Mit Parametern gestartet (z.B. Rechtsklick im Kontextmenü oder Drag & Drop) -> Shredder-Modus
-    let mut paths_to_shred: Vec<PathBuf> = Vec::new();
-    let mut auto_confirm = false;
-    let mut is_quiet = false;
-    let mut purge_journal = false;
-    let mut elevated_confirmed = false;
-    let mut custom_passes = None;
-
-    let mut iter = args.into_iter();
-    while let Some(arg) = iter.next() {
-        if arg == "--quiet" {
-            auto_confirm = true;
-            is_quiet = true;
-        } else if arg == "-y" || arg == "--yes" {
-            auto_confirm = true;
-        } else if arg == "--admin" || arg == "--admin-purge" {
-            purge_journal = true;
-        } else if arg == "--elevated-confirmed" {
-            // Direkt über „Als Administrator vernichten“ gestartet: kein doppeltes Auswahlfenster
-            elevated_confirmed = true;
-            purge_journal = true;
-        } else if arg == "--purge-journal" || arg == "-p" {
-            purge_journal = true;
-        } else if arg == "--passes" {
-            if let Some(val) = iter.next() {
-                if let Ok(n) = val.parse::<usize>() {
-                    custom_passes = Some(n);
+    let mut candidate_paths = parsed.raw_paths;
+    for list_path in &parsed.filelists {
+        match read_paths_from_filelist(list_path, true) {
+            Ok(mut listed) => candidate_paths.append(&mut listed),
+            Err(err) => {
+                if is_quiet {
+                    eprintln!("[FEHLER] {}", err);
+                } else {
+                    report_cli_error(&err, false);
                 }
-            }
-        } else {
-            let p = PathBuf::from(arg);
-            if fs::symlink_metadata(&p).is_ok() || p.exists() {
-                paths_to_shred.push(p);
+                std::process::exit(1);
             }
         }
     }
+
+    let paths_to_shred: Vec<PathBuf> = candidate_paths
+        .into_iter()
+        .filter(|p| fs::symlink_metadata(p).is_ok() || p.exists())
+        .collect();
 
     if paths_to_shred.is_empty() {
-        show_message_box(
-            "Keine gültigen Dateien oder Ordner zum Vernichten gefunden.",
-            "WinShred - Hinweis",
-            MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND,
-        );
-        return;
+        if is_quiet {
+            eprintln!("[FEHLER] Keine gueltigen Dateien oder Ordner zum Vernichten gefunden.");
+            std::process::exit(1);
+        } else {
+            show_message_box(
+                "Keine gültigen Dateien oder Ordner zum Vernichten gefunden.",
+                "WinShred - Hinweis",
+                MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND,
+            );
+            return;
+        }
     }
 
     // Sicherheitsprüfung (#5 & #18): Blockade für Systemkern/Roots und erzwungene Warnung für relevante Ordner
@@ -4713,12 +5258,22 @@ fn main() {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        show_message_box(&msg, "WinShred - Schutzfunktion", MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+        if is_quiet {
+            eprintln!("[FEHLER] {}", msg);
+        } else {
+            show_message_box(&msg, "WinShred - Schutzfunktion", MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+        }
     }
 
     if valid_paths.is_empty() {
+        if is_quiet {
+            std::process::exit(1);
+        }
         return;
     }
+
+    // Auf HDDs standardmäßig 3-Pass DoD 5220.22-M; auf SSD/NVMe & residenten Dateien intern immer 1 Pass (#7)
+    let num_passes = custom_passes.unwrap_or(3);
 
     let is_admin = unsafe { IsUserAnAdmin() } != 0;
     let has_important = !important_reasons.is_empty();
@@ -4728,7 +5283,8 @@ fn main() {
     // Sicherheitsabfrage vor dem Vernichten (#17 & #18)
     if should_prompt {
         if !elevated_confirmed {
-            let (choice, skip_checked) = show_confirmation_dialog(&valid_paths, is_admin, &important_reasons);
+            let (choice, skip_checked) =
+                show_confirmation_dialog(&valid_paths, is_admin, &important_reasons, num_passes);
             match choice {
                 ConfirmationResult::Cancel => return,
                 ConfirmationResult::ShredStandard => {
@@ -4738,18 +5294,7 @@ fn main() {
                 ConfirmationResult::ShredAsAdmin => {
                     set_skip_safety_prompt(skip_checked);
                     if !is_admin {
-                        let mut parts = vec![
-                            String::from("--admin"),
-                            String::from("--elevated-confirmed"),
-                        ];
-                        if let Some(p_count) = custom_passes {
-                            parts.push(String::from("--passes"));
-                            parts.push(p_count.to_string());
-                        }
-                        for p in &valid_paths {
-                            parts.push(quote_windows_cli_arg(&p.to_string_lossy()));
-                        }
-                        elevate_relaunch(&parts.join(" "));
+                        relaunch_elevated_with_paths(&valid_paths, custom_passes);
                         return;
                     } else {
                         purge_journal = true;
@@ -4770,8 +5315,6 @@ fn main() {
         }
         set_skip_safety_prompt(skip_checked_final);
     }
-
-    let num_passes = custom_passes.unwrap_or(1);
 
     // Cursor auf Warte-Zustand (Sanduhr/Spinning Wheel) setzen
     let h_wait = unsafe { LoadCursorW(std::ptr::null_mut(), IDC_WAIT as *const u16) };
@@ -4815,7 +5358,15 @@ fn main() {
         )
     };
 
-    if !is_quiet {
+    if is_quiet {
+        if outcome.errors > 0 || outcome.journal_errors > 0 {
+            eprintln!(
+                "[FEHLER] Vernichtung mit {} Datei-Fehler(n) und {} Journal-Fehler(n) beendet.",
+                outcome.errors, outcome.journal_errors
+            );
+            std::process::exit(1);
+        }
+    } else {
         if outcome.cancelled {
             show_message_box(
                 "Der Vernichtungsvorgang wurde durch den Benutzer abgebrochen.\nEinige Elemente wurden möglicherweise bereits vernichtet.",
@@ -4828,6 +5379,7 @@ fn main() {
                 "WinShred - Hinweis",
                 MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND,
             );
+            std::process::exit(1);
         } else if outcome.journal_errors > 0 {
             show_message_box(
                 &format!(
@@ -4837,6 +5389,7 @@ fn main() {
                 "WinShred - Hinweis zur Journal-Bereinigung",
                 MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND,
             );
+            std::process::exit(1);
         } else if !auto_confirm {
             let msg = if outcome.journal_purged {
                 "WinShred erfolgreich abgeschlossen.\nAlle ausgewählten Elemente wurden unwiderruflich vernichtet und das NTFS USN-Journal wurde bereinigt."
@@ -4954,15 +5507,20 @@ mod tests {
         let link_file = temp_dir.join("symlink.txt");
         fs::write(&target_file, b"secret data").unwrap();
 
-        let status = Command::new("cmd")
-            .args(["/c", "mklink", &link_file.to_string_lossy(), &target_file.to_string_lossy()])
-            .status();
-        if let Ok(s) = status {
-            if s.success() {
+        match std::os::windows::fs::symlink_file(&target_file, &link_file) {
+            Ok(()) => {
                 let meta = fs::symlink_metadata(&link_file).unwrap();
                 println!("file symlink is_symlink: {}", meta.file_type().is_symlink());
                 assert!(meta.file_type().is_symlink());
                 let _ = fs::remove_file(&link_file);
+            }
+            Err(e) if e.raw_os_error() == Some(1314) => {
+                // ERROR_PRIVILEGE_NOT_HELD ohne Entwicklermodus / SeCreateSymbolicLinkPrivilege
+                eprintln!("Hinweis: Symlink-Test mangels SeCreateSymbolicLinkPrivilege (1314) uebersprungen.");
+            }
+            Err(e) => {
+                let _ = fs::remove_dir_all(&temp_dir);
+                panic!("Unerwarteter Fehler beim Erstellen des Datei-Symlinks: {}", e);
             }
         }
         let _ = fs::remove_dir_all(&temp_dir);
@@ -4989,15 +5547,17 @@ mod tests {
 
     #[test]
     fn test_drive_media_type_detection() {
-        let c_drive = Path::new("C:\\");
-        let media_c = get_drive_media_type(c_drive);
-        println!("Medientyp C: {:?}", media_c);
-        assert_ne!(media_c, DriveMediaType::Unknown);
+        let probe_path = env::temp_dir();
+        let media_probe = get_drive_media_type(&probe_path);
+        println!("Medientyp Temp/Systemlaufwerk ({:?}): {:?}", probe_path, media_probe);
+        assert_ne!(media_probe, DriveMediaType::Unknown);
 
         let a_drive = Path::new("A:\\");
-        let media_a = get_drive_media_type(a_drive);
-        println!("Medientyp A: {:?}", media_a);
-        assert_ne!(media_a, DriveMediaType::Unknown);
+        if a_drive.exists() {
+            let media_a = get_drive_media_type(a_drive);
+            println!("Medientyp A: {:?}", media_a);
+            assert_ne!(media_a, DriveMediaType::Unknown);
+        }
     }
 
     #[test]
@@ -5343,6 +5903,71 @@ mod tests {
         assert_eq!(quote_windows_cli_arg(r"C:\Test Ordner\"), r#""C:\Test Ordner\\""#);
         assert_eq!(quote_windows_cli_arg(""), r#""""#);
         assert_eq!(quote_windows_cli_arg(r#"a\"b"#), r#""a\\\"b""#);
+    }
+
+    #[test]
+    fn test_cli_parsing_flags_and_errors() {
+        let ok = parse_cli_args(["-y", "--quiet", "--passes", "3", "-p", "--", "-dash-file.txt"]).unwrap();
+        assert!(ok.auto_confirm);
+        assert!(ok.is_quiet);
+        assert!(ok.purge_journal);
+        assert_eq!(ok.custom_passes, Some(3));
+        assert_eq!(ok.raw_paths, vec![PathBuf::from("-dash-file.txt")]);
+
+        let help = parse_cli_args(["--help"]).unwrap();
+        assert!(help.show_help);
+
+        let eq = parse_cli_args(["--passes=5", "--filelist=C:\\tmp\\list.txt"]).unwrap();
+        assert_eq!(eq.custom_passes, Some(5));
+        assert_eq!(eq.filelists, vec![PathBuf::from(r"C:\tmp\list.txt")]);
+
+        assert!(parse_cli_args(["--passes", "0", "a.txt"]).is_err());
+        assert!(parse_cli_args(["--passes", "abc"]).is_err());
+        assert!(parse_cli_args(["--passes"]).is_err());
+        assert!(parse_cli_args(["--filelist"]).is_err());
+        assert!(parse_cli_args(["--unbekannt"]).is_err());
+    }
+
+    #[test]
+    fn test_filelist_reading_and_cleanup() {
+        let temp_dir = env::temp_dir().join(format!("winshred_filelist_test_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let list_path = temp_dir.join("items.lst");
+        fs::write(&list_path, "\u{feff}C:\\Pfad Eins\\a.txt\n\n  D:\\Zwei\\b.bin  \n").unwrap();
+
+        let paths = read_paths_from_filelist(&list_path, true).unwrap();
+        assert_eq!(
+            paths,
+            vec![PathBuf::from(r"C:\Pfad Eins\a.txt"), PathBuf::from(r"D:\Zwei\b.bin")]
+        );
+        assert!(!list_path.exists());
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_count_items_and_bytes_cluster_accuracy() {
+        let temp_dir = env::temp_dir().join(format!("winshred_count_test_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        // 5000 Bytes -> nicht-resident, belegt auf NTFS mindestens 2 Cluster (>= 8192 Bytes)
+        let big_file = temp_dir.join("nonresident.bin");
+        fs::write(&big_file, vec![0x42u8; 5000]).unwrap();
+        // 15 Bytes -> resident in MFT -> exakt 15 Bytes
+        let tiny_file = temp_dir.join("tiny.txt");
+        fs::write(&tiny_file, b"123456789012345").unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let is_ssd_tmp = matches!(get_drive_media_type(&temp_dir), DriveMediaType::SsdNvme { .. });
+        let (items, bytes) = count_items_and_bytes(std::slice::from_ref(&temp_dir), 3, &cancel);
+        assert_eq!(items, 3); // temp_dir + big_file + tiny_file
+
+        let expected_big = {
+            let f = OpenOptions::new().read(true).open(&big_file).unwrap();
+            let w = compute_non_resident_wipe_len(&big_file, &f, 5000);
+            w * if is_ssd_tmp { 1 } else { 3 }
+        };
+        assert_eq!(bytes, expected_big + 15);
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
 
