@@ -5,6 +5,7 @@ use std::ffi::{c_void, OsStr};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -460,6 +461,11 @@ unsafe extern "system" {
     ) -> i32;
 
     fn GetLastError() -> u32;
+    fn GetLongPathNameW(
+        lpszShortPath: *const u16,
+        lpszLongPath: *mut u16,
+        cchBuffer: u32,
+    ) -> u32;
     fn GetCurrentThreadId() -> u32;
     fn GetCurrentProcess() -> *mut c_void;
     fn AttachConsole(dwProcessId: u32) -> i32;
@@ -542,6 +548,10 @@ const FILE_ATTRIBUTE_READONLY: u32 = 0x00000001;
 #[cfg(test)]
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x00000080;
 const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x00000200;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+const FILE_ATTRIBUTE_OFFLINE: u32 = 0x00001000;
+const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x00040000;
+const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x00400000;
 const IDC_WAIT: usize = 32514;
 const LR_SHARED: u32 = 0x00008000;
 
@@ -563,18 +573,71 @@ fn to_wide_chars(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(Some(0)).collect()
 }
 
-/// Wandelt Pfade mit langer Gesamtlänge (>= 240 UTF-16-Einheiten) in `\\?\`- bzw. `\\?\UNC\`-Pfade um,
-/// damit sowohl direkte Win32-APIs als auch `std::fs` unabhängig von `LongPathsEnabled` funktionieren.
+fn is_reparse_or_cloud_placeholder_meta(meta: &fs::Metadata) -> bool {
+    let attrs = meta.file_attributes();
+    meta.file_type().is_symlink()
+        || (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || (attrs & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)) != 0
+}
+
+fn is_reparse_dir_meta(meta: &fs::Metadata) -> bool {
+    meta.file_type().is_symlink() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+}
+
+fn needs_verbatim_for_win32_quirks(path: &Path) -> bool {
+    for comp in path.components() {
+        if let std::path::Component::Normal(seg) = comp {
+            let s = seg.to_string_lossy();
+            if s.ends_with('.') || s.ends_with(' ') {
+                return true;
+            }
+            let stem = s.split('.').next().unwrap_or("").trim_end_matches(' ');
+            if matches!(
+                stem.to_ascii_uppercase().as_str(),
+                "CON"
+                    | "PRN"
+                    | "AUX"
+                    | "NUL"
+                    | "COM1"
+                    | "COM2"
+                    | "COM3"
+                    | "COM4"
+                    | "COM5"
+                    | "COM6"
+                    | "COM7"
+                    | "COM8"
+                    | "COM9"
+                    | "LPT1"
+                    | "LPT2"
+                    | "LPT3"
+                    | "LPT4"
+                    | "LPT5"
+                    | "LPT6"
+                    | "LPT7"
+                    | "LPT8"
+                    | "LPT9"
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Wandelt Pfade mit langer Gesamtlänge (>= 240 UTF-16-Einheiten) sowie Namen mit Trailing-Dot/Space
+/// oder reservierten DOS-Namen in `\\?\`- bzw. `\\?\UNC\`-Pfade um,
+/// damit direkte Win32-APIs und `std::fs` unabhängig von `LongPathsEnabled` exakt arbeiten.
 fn to_fs_path(path: &Path) -> std::borrow::Cow<'_, Path> {
     let raw: Vec<u16> = path.as_os_str().encode_wide().collect();
     let s = path.to_string_lossy();
     if s.starts_with(r"\\?\") || s.starts_with(r"\\.\") {
         return std::borrow::Cow::Borrowed(path);
     }
-    if raw.len() >= 240 || path.is_relative() {
+    let has_quirks = needs_verbatim_for_win32_quirks(path);
+    if raw.len() >= 240 || path.is_relative() || has_quirks {
         let abs = resolve_absolute_no_symlink(path);
         let abs_wide_len = abs.as_os_str().encode_wide().count();
-        if raw.len() >= 240 || abs_wide_len >= 240 {
+        if raw.len() >= 240 || abs_wide_len >= 240 || has_quirks {
             let abs_s = abs.to_string_lossy();
             let verbatim = if abs_s.starts_with(r"\\?\") || abs_s.starts_with(r"\\.\") {
                 abs_s.into_owned()
@@ -595,6 +658,45 @@ fn path_to_wide(path: &Path) -> Vec<u16> {
         .encode_wide()
         .chain(Some(0))
         .collect()
+}
+
+fn notify_shell_item_removed(orig_path: &Path, event: i32) {
+    let abs = resolve_absolute_no_symlink(orig_path);
+    let s = abs.to_string_lossy();
+    let clean = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", rest)
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.into_owned()
+    };
+    let wide = to_wide_chars(&clean);
+    unsafe {
+        SHChangeNotify(
+            event,
+            SHCNF_PATHW | SHCNF_FLUSH,
+            wide.as_ptr() as *const c_void,
+            std::ptr::null(),
+        );
+    }
+}
+
+fn expand_short_names_no_symlink(path: &Path) -> PathBuf {
+    let abs = resolve_absolute_no_symlink(path);
+    let wide = path_to_wide(&abs);
+    let mut buf = [0u16; 1024];
+    let len = unsafe { GetLongPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    if len > 0 && (len as usize) < buf.len() {
+        return PathBuf::from(String::from_utf16_lossy(&buf[..len as usize]));
+    }
+    if len as usize >= buf.len() {
+        let mut big = vec![0u16; len as usize + 1];
+        let len2 = unsafe { GetLongPathNameW(wide.as_ptr(), big.as_mut_ptr(), big.len() as u32) };
+        if len2 > 0 && (len2 as usize) < big.len() {
+            return PathBuf::from(String::from_utf16_lossy(&big[..len2 as usize]));
+        }
+    }
+    abs
 }
 
 /// Bringt ein Win32-Fenster in den Vordergrund und hält es bei Bedarf `HWND_TOPMOST`.
@@ -1387,9 +1489,19 @@ fn shred_alternate_streams_with_reporter<R: ShredReporter>(
         let len = file.metadata()?.len();
         if len > 0 {
             let is_res = is_file_resident_in_mft(&file, len);
-            wipe_open_file_with_reporter(&mut file, len, num_passes, is_ssd, is_res, reporter)?;
+            let wipe_len = if is_res {
+                len
+            } else {
+                compute_non_resident_wipe_len(&stream_path, &file, len)
+            };
+            wipe_open_file_with_reporter(&mut file, wipe_len, num_passes, is_ssd, is_res, reporter)?;
         } else {
-            neutralize_timestamps(&file);
+            let alloc = get_file_allocation_size(&file);
+            if alloc > 0 {
+                wipe_open_file_with_reporter(&mut file, alloc, num_passes, is_ssd, false, reporter)?;
+            } else {
+                neutralize_timestamps(&file);
+            }
         }
         drop(file);
 
@@ -1485,6 +1597,7 @@ pub fn secure_single_rename(path: &Path) -> io::Result<PathBuf> {
 
     let mut current_path = clean_path.clone();
     let mut ro_guard = ReadonlyGuard::acquire(&current_path);
+    let mut renamed_at_least_once = false;
 
     // Runde 1: Langer Zufallsname (überschreibt lange Originalnamen im Directory-Index, falls Pfadlänge reicht)
     let orig_len = current_path
@@ -1495,18 +1608,31 @@ pub fn secure_single_rename(path: &Path) -> io::Result<PathBuf> {
     if let Ok(next) = rename_step_unique(&current_path, parent, long_len, "s_", ".tmp") {
         current_path = next;
         ro_guard.disarm();
+        renamed_at_least_once = true;
     }
 
     // Runde 2: Mittlerer Zufallsname
     if let Ok(next) = rename_step_unique(&current_path, parent, 20, "w_", ".dat") {
         current_path = next;
         ro_guard.disarm();
+        renamed_at_least_once = true;
     }
 
-    // Runde 3 (Final): Kurzer Zufallsname mit `shred_`-Präfix; Fehler werden hier explizit gemeldet
-    let final_path = rename_step_unique(&current_path, parent, 16, "shred_", ".tmp")?;
-    ro_guard.disarm();
-    Ok(final_path)
+    // Runde 3 (Final): Kurzer Zufallsname mit `shred_`-Präfix; wurde zuvor bereits umbenannt,
+    // fallen wir bei Fehler auf `current_path` zurück, damit keine verwaiste 0-Byte-Datei bleibt.
+    match rename_step_unique(&current_path, parent, 16, "shred_", ".tmp") {
+        Ok(final_path) => {
+            ro_guard.disarm();
+            Ok(final_path)
+        }
+        Err(e) => {
+            if renamed_at_least_once {
+                Ok(current_path)
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 fn enable_manage_volume_privilege() {
@@ -1870,6 +1996,8 @@ fn normalize_win_path_for_compare(path: &Path, follow_symlinks: bool) -> String 
         format!(r"\\{}", rest)
     } else if let Some(rest) = s.strip_prefix(r"\\?\") {
         rest.to_string()
+    } else if let Some(rest) = s.strip_prefix(r"\\.\") {
+        rest.to_string()
     } else {
         s.to_string()
     };
@@ -1911,52 +2039,101 @@ fn env_norm(name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+fn classify_root_subpath(drive_prefix: &str, norm: &str, after_drive: &str) -> Option<PathSafetyLevel> {
+    let first_segment = after_drive.split('\\').next().unwrap_or("");
+
+    for critical_sub in ["boot", "efi", "recovery", "system volume information"] {
+        let full = format!("{}\\{}", drive_prefix, critical_sub);
+        if is_same_or_subpath(norm, &full) {
+            return Some(PathSafetyLevel::Blocked(format!(
+                "System-/Boot-Verzeichnis ({})",
+                full.to_uppercase()
+            )));
+        }
+    }
+    if after_drive.eq_ignore_ascii_case("$recycle.bin") {
+        return Some(PathSafetyLevel::Blocked(
+            "Windows-Papierkorb-Stammverzeichnis ($Recycle.Bin)".to_string(),
+        ));
+    }
+
+    for important_root_dir in ["windows.old", "perflogs", "inetpub"] {
+        let full = format!("{}\\{}", drive_prefix, important_root_dir);
+        if is_same_or_subpath(norm, &full) {
+            return Some(PathSafetyLevel::Important(format!(
+                "Relevanter System-/Installationsordner ({})",
+                important_root_dir
+            )));
+        }
+    }
+    if first_segment == after_drive
+        && matches!(
+            first_segment,
+            "pagefile.sys" | "hiberfil.sys" | "swapfile.sys" | "bootmgr" | "bootnxt"
+        )
+    {
+        return Some(PathSafetyLevel::Important(format!(
+            "Systemdatei im Stammverzeichnis ({})",
+            first_segment
+        )));
+    }
+    None
+}
+
 fn classify_normalized_path(norm: &str) -> PathSafetyLevel {
     let is_volume_guid_root = norm.starts_with("volume{") && !norm.contains('\\');
+    let is_device_ns = norm == "globalroot"
+        || norm.starts_with("globalroot\\")
+        || norm.starts_with("physicaldrive")
+        || norm.starts_with("harddiskvolume");
     if norm.is_empty()
         || (norm.len() == 2 && norm.ends_with(':'))
         || is_volume_guid_root
+        || is_device_ns
         || is_unc_share_or_server_root(norm)
     {
-        return PathSafetyLevel::Blocked("Laufwerks- oder Netzwerkfreigabe-Stammverzeichnis".to_string());
+        return PathSafetyLevel::Blocked("Laufwerks-, Geräte- oder Netzwerkfreigabe-Stammverzeichnis".to_string());
+    }
+
+    // Administrative Freigaben wie \\localhost\C$\Windows\System32 auf lokalen Laufwerkspfad abbilden
+    if let Some(rest) = norm.strip_prefix(r"\\") {
+        let mut segs = rest.split('\\').filter(|p| !p.is_empty());
+        if let (Some(_host), Some(share)) = (segs.next(), segs.next()) {
+            let share_bytes = share.as_bytes();
+            if share_bytes.len() == 2 && share_bytes[0].is_ascii_alphabetic() && share_bytes[1] == b'$' {
+                let tail: Vec<&str> = segs.collect();
+                let mapped = if tail.is_empty() {
+                    format!("{}:", share_bytes[0] as char)
+                } else {
+                    format!("{}:\\{}", share_bytes[0] as char, tail.join("\\"))
+                };
+                return classify_normalized_path(&mapped);
+            }
+        }
+    }
+
+    // Volume-GUID-Unterpfade (z. B. \\?\Volume{...}\EFI, \Boot, \Windows\System32)
+    if norm.starts_with("volume{")
+        && let Some((vol_prefix, after_vol)) = norm.split_once('\\')
+    {
+        if let Some(level) = classify_root_subpath(vol_prefix, norm, after_vol) {
+            return level;
+        }
+        if let Some(sys_drive) = env_norm("SystemDrive") {
+            let synthetic = format!("{}\\{}", sys_drive, after_vol);
+            let sub_level = classify_normalized_path(&synthetic);
+            if !matches!(sub_level, PathSafetyLevel::Safe) {
+                return sub_level;
+            }
+        }
     }
 
     // Laufwerksunabhängige System-/Boot-Container direkt auf beliebigen Laufwerken (<Drive>:\<ordner>)
     if norm.len() > 3 && norm.as_bytes().get(1) == Some(&b':') && norm.as_bytes().get(2) == Some(&b'\\') {
         let after_drive = &norm[3..];
-        let first_segment = after_drive.split('\\').next().unwrap_or("");
         let drive_prefix = &norm[..2];
-
-        for critical_sub in ["boot", "efi", "recovery", "system volume information"] {
-            let full = format!("{}\\{}", drive_prefix, critical_sub);
-            if is_same_or_subpath(norm, &full) {
-                return PathSafetyLevel::Blocked(format!(
-                    "System-/Boot-Verzeichnis ({})",
-                    full.to_uppercase()
-                ));
-            }
-        }
-        if after_drive.eq_ignore_ascii_case("$recycle.bin") {
-            return PathSafetyLevel::Blocked("Windows-Papierkorb-Stammverzeichnis ($Recycle.Bin)".to_string());
-        }
-
-        // Kritische Root-Systemdateien oder bekannte Root-Ordner direkt auf System/Datenlaufwerk
-        for important_root_dir in ["windows.old", "perflogs", "inetpub"] {
-            let full = format!("{}\\{}", drive_prefix, important_root_dir);
-            if is_same_or_subpath(norm, &full) {
-                return PathSafetyLevel::Important(format!(
-                    "Relevanter System-/Installationsordner ({})",
-                    important_root_dir
-                ));
-            }
-        }
-        if first_segment == after_drive
-            && matches!(
-                first_segment,
-                "pagefile.sys" | "hiberfil.sys" | "swapfile.sys" | "bootmgr" | "bootnxt"
-            )
-        {
-            return PathSafetyLevel::Important(format!("Systemdatei im Stammverzeichnis ({})", first_segment));
+        if let Some(level) = classify_root_subpath(drive_prefix, norm, after_drive) {
+            return level;
         }
     }
 
@@ -2019,6 +2196,9 @@ fn classify_normalized_path(norm: &str) -> PathSafetyLevel {
         if norm == format!("{}\\public", users_dir) {
             return PathSafetyLevel::Blocked("Öffentliches Benutzerverzeichnis (\\Users\\Public)".to_string());
         }
+        if is_strict_subpath(norm, &format!("{}\\public", users_dir)) {
+            return PathSafetyLevel::Important(format!("Unterordner/Datei im öffentlichen Benutzerverzeichnis ({})", norm));
+        }
         // Direktes Profilverzeichnis C:\Users\<Name>
         if let Some(rest) = norm.strip_prefix(&format!("{}\\", users_dir))
             && !rest.contains('\\')
@@ -2077,17 +2257,32 @@ pub fn classify_path_safety(path: &Path) -> PathSafetyLevel {
         return PathSafetyLevel::Blocked("Leerer Pfad".to_string());
     }
 
-    // 1. Prüfung des Pfads selbst ohne Symlink-Auflösung
+    // 1. Prüfung des Pfads selbst ohne Symlink-Auflösung (inkl. 8.3-Kurzname-Erweiterung ohne Symlink-Auflösung)
     let own_norm = normalize_win_path_for_compare(path, false);
     let own_level = classify_normalized_path(&own_norm);
     if matches!(own_level, PathSafetyLevel::Blocked(_)) {
         return own_level;
     }
 
+    let long_no_sym = expand_short_names_no_symlink(path);
+    let long_norm = normalize_win_path_for_compare(&long_no_sym, false);
+    let long_level = if long_norm != own_norm {
+        let lvl = classify_normalized_path(&long_norm);
+        if matches!(lvl, PathSafetyLevel::Blocked(_)) {
+            return lvl;
+        }
+        match (&own_level, &lvl) {
+            (PathSafetyLevel::Safe, PathSafetyLevel::Important(_)) => lvl,
+            _ => own_level,
+        }
+    } else {
+        own_level
+    };
+
     // 2. Reparse-Point / Symlink prüfen: Ziel nicht stillschweigend blockieren, sondern nur warnen
     let fs_path = to_fs_path(path);
     let is_symlink = fs::symlink_metadata(fs_path.as_ref())
-        .map(|m| m.file_type().is_symlink())
+        .map(is_reparse_or_cloud_placeholder_meta_ref)
         .unwrap_or(false);
 
     if is_symlink {
@@ -2103,21 +2298,21 @@ pub fn classify_path_safety(path: &Path) -> PathSafetyLevel {
                 PathSafetyLevel::Safe => {}
             }
         }
-        return own_level;
+        return long_level;
     }
 
     // 3. Für normale Dateien/Ordner zusätzlich aufgelösten Pfad prüfen (z. B. subst-Laufwerke / Mount-Points)
     if let Ok(canon) = fs_path.as_ref().canonicalize() {
         let canon_norm = normalize_win_path_for_compare(&canon, false);
         let canon_level = classify_normalized_path(&canon_norm);
-        match (&own_level, &canon_level) {
+        match (&long_level, &canon_level) {
             (_, PathSafetyLevel::Blocked(_)) => return canon_level,
             (PathSafetyLevel::Safe, PathSafetyLevel::Important(_)) => return canon_level,
             _ => {}
         }
     }
 
-    own_level
+    long_level
 }
 
 fn is_dangerous_or_root_path(path: &Path) -> bool {
@@ -2126,6 +2321,56 @@ fn is_dangerous_or_root_path(path: &Path) -> bool {
 
 pub fn shred_file(path: &Path, num_passes: usize) -> io::Result<()> {
     shred_file_with_reporter(path, num_passes, &mut NoopShredReporter)
+}
+
+fn is_reparse_or_cloud_placeholder_meta_ref(meta: fs::Metadata) -> bool {
+    is_reparse_or_cloud_placeholder_meta(&meta)
+}
+
+fn get_file_allocation_size(file: &fs::File) -> u64 {
+    let mut std_info = FILE_STANDARD_INFO {
+        allocation_size: 0,
+        end_of_file: 0,
+        number_of_links: 1,
+        delete_pending: 0,
+        directory: 0,
+    };
+    let ret = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FILE_STANDARD_INFO_CLASS,
+            &mut std_info as *mut _ as *mut c_void,
+            std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    if ret != 0 && std_info.allocation_size > 0 {
+        std_info.allocation_size as u64
+    } else {
+        0
+    }
+}
+
+fn get_file_link_count(file: &fs::File) -> u32 {
+    let mut std_info = FILE_STANDARD_INFO {
+        allocation_size: 0,
+        end_of_file: 0,
+        number_of_links: 1,
+        delete_pending: 0,
+        directory: 0,
+    };
+    let ret = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FILE_STANDARD_INFO_CLASS,
+            &mut std_info as *mut _ as *mut c_void,
+            std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    if ret != 0 && std_info.number_of_links > 0 {
+        std_info.number_of_links
+    } else {
+        1
+    }
 }
 
 fn compute_non_resident_wipe_len(path: &Path, file: &fs::File, len: u64) -> u64 {
@@ -2171,7 +2416,14 @@ fn estimate_ads_wipe_bytes(path: &Path, num_passes: usize, is_ssd: bool) -> u64 
             if len > 0 {
                 let is_res = is_file_resident_in_mft(&file, len);
                 let eff = if is_ssd || is_res { 1 } else { num_passes.max(1) };
-                total += len * eff as u64;
+                let wipe_len = if is_res {
+                    len
+                } else {
+                    compute_non_resident_wipe_len(&stream_path, &file, len)
+                };
+                total += wipe_len * eff as u64;
+            } else {
+                total += get_file_allocation_size(&file);
             }
         }
     }
@@ -2179,12 +2431,16 @@ fn estimate_ads_wipe_bytes(path: &Path, num_passes: usize, is_ssd: bool) -> u64 
 }
 
 fn estimate_file_wipe_bytes(path: &Path, logical_len: u64, num_passes: usize, is_ssd: bool) -> u64 {
-    let ads_bytes = estimate_ads_wipe_bytes(path, num_passes, is_ssd);
-    if logical_len == 0 {
-        return ads_bytes;
-    }
     let fs_path = to_fs_path(path);
     if let Ok(file) = OpenOptions::new().read(true).open(fs_path.as_ref()) {
+        if get_file_link_count(&file) > 1 {
+            // Hardlink: nur der Verzeichniseintrag wird entfernt, nicht die gemeinsamen Daten
+            return 0;
+        }
+        let ads_bytes = estimate_ads_wipe_bytes(path, num_passes, is_ssd);
+        if logical_len == 0 {
+            return get_file_allocation_size(&file) + ads_bytes;
+        }
         let is_resident = is_file_resident_in_mft(&file, logical_len);
         let effective_passes = if is_ssd || is_resident {
             1
@@ -2205,14 +2461,56 @@ fn estimate_file_wipe_bytes(path: &Path, logical_len: u64, num_passes: usize, is
         };
         return wipe_len * effective_passes as u64 + ads_bytes;
     }
+    let ads_bytes = estimate_ads_wipe_bytes(path, num_passes, is_ssd);
+    if logical_len == 0 {
+        return ads_bytes;
+    }
     let effective_passes = if is_ssd { 1 } else { num_passes.max(1) };
     logical_len * effective_passes as u64 + ads_bytes
+}
+
+fn is_ssd_for_path(path: &Path, drive_ssd_cache: &mut std::collections::HashMap<String, bool>) -> bool {
+    if let Some(drive) = extract_drive_letter(path) {
+        *drive_ssd_cache.entry(drive).or_insert_with(|| {
+            matches!(get_drive_media_type(path), DriveMediaType::SsdNvme { .. })
+        })
+    } else {
+        matches!(get_drive_media_type(path), DriveMediaType::SsdNvme { .. })
+    }
+}
+
+fn finalize_and_delete_file<R: ShredReporter>(
+    orig_path: &Path,
+    mut ro_guard: ReadonlyGuard,
+    reporter: &mut R,
+) -> io::Result<()> {
+    let final_path = secure_single_rename(orig_path)?;
+    ro_guard.disarm();
+    let mut final_ro = ReadonlyGuard::acquire(&final_path);
+    let fs_final = to_fs_path(&final_path);
+    fs::remove_file(fs_final.as_ref())?;
+    final_ro.disarm();
+
+    // Explorer über die Löschung des ursprünglichen Pfads benachrichtigen
+    notify_shell_item_removed(orig_path, SHCNE_DELETE);
+
+    reporter.on_item_done(orig_path, false);
+    Ok(())
 }
 
 pub fn shred_file_with_reporter<R: ShredReporter>(
     path: &Path,
     num_passes: usize,
     reporter: &mut R,
+) -> io::Result<()> {
+    shred_file_with_reporter_cached(path, num_passes, reporter, None)
+}
+
+fn shred_file_with_reporter_cached<R: ShredReporter>(
+    path: &Path,
+    num_passes: usize,
+    reporter: &mut R,
+    drive_ssd_cache: Option<&mut std::collections::HashMap<String, bool>>,
 ) -> io::Result<()> {
     if reporter.is_cancelled() {
         return Err(io::Error::new(
@@ -2222,18 +2520,39 @@ pub fn shred_file_with_reporter<R: ShredReporter>(
     }
     reporter.on_item_start(path, false);
 
-    // Zuerst Schreibzugriff auf die Hauptdatei absichern, bevor Attribute oder ADS verändert werden
-    let mut ro_guard = ReadonlyGuard::acquire(path);
     let fs_path = to_fs_path(path);
+    if let Ok(sym_meta) = fs::symlink_metadata(fs_path.as_ref())
+        && is_reparse_or_cloud_placeholder_meta(&sym_meta)
+    {
+        let ro_guard = ReadonlyGuard::acquire(path);
+        return finalize_and_delete_file(path, ro_guard, reporter);
+    }
+
+    // Zuerst Schreibzugriff auf die Hauptdatei absichern, bevor Attribute oder ADS verändert werden
+    let ro_guard = ReadonlyGuard::acquire(path);
     let mut file = OpenOptions::new().write(true).read(true).open(fs_path.as_ref())?;
 
-    let media_type = get_drive_media_type(path);
-    let is_ssd = matches!(media_type, DriveMediaType::SsdNvme { .. });
+    // NTFS-Hardlinks (nlink > 1): Geteilte Datenblöcke NIEMALS überschreiben/kürzen,
+    // um andere Hardlinks nicht zu zerstören – nur diesen Verzeichniseintrag sicher entfernen.
+    if get_file_link_count(&file) > 1 {
+        drop(file);
+        return finalize_and_delete_file(path, ro_guard, reporter);
+    }
+
+    let is_ssd = match drive_ssd_cache {
+        Some(cache) => is_ssd_for_path(path, cache),
+        None => matches!(get_drive_media_type(path), DriveMediaType::SsdNvme { .. }),
+    };
 
     // Alternate Data Streams erst nach erfolgreichem Öffnen der Hauptdatei schreddern
     shred_alternate_streams_with_reporter(path, num_passes, is_ssd, reporter)?;
 
     let len = file.metadata()?.len();
+    let alloc_size = if len == 0 {
+        get_file_allocation_size(&file)
+    } else {
+        0
+    };
     if len > 0 {
         let is_resident = is_file_resident_in_mft(&file, len);
         let sparse_ranges = if !is_resident && is_sparse_file(path) {
@@ -2270,6 +2589,17 @@ pub fn shred_file_with_reporter<R: ShredReporter>(
                 reporter,
             )?;
         }
+    } else if alloc_size > 0 {
+        // Vorallokierte 0-Byte-Datei (EOF = 0, AllocationSize > 0): belegte Cluster schreddern
+        let wipe_len = compute_non_resident_wipe_len(path, &file, alloc_size);
+        wipe_open_file_with_reporter(
+            &mut file,
+            wipe_len,
+            num_passes,
+            is_ssd,
+            false,
+            reporter,
+        )?;
     } else {
         neutralize_timestamps(&file);
     }
@@ -2283,27 +2613,7 @@ pub fn shred_file_with_reporter<R: ShredReporter>(
         ));
     }
 
-    let final_path = secure_single_rename(path)?;
-    ro_guard.disarm();
-    let mut final_ro = ReadonlyGuard::acquire(&final_path);
-    let fs_final = to_fs_path(&final_path);
-    fs::remove_file(fs_final.as_ref())?;
-    final_ro.disarm();
-
-    // Explorer über die Löschung des ursprünglichen Pfads benachrichtigen
-    let abs_orig = resolve_absolute_no_symlink(path);
-    let wide_deleted = path_to_wide(&abs_orig);
-    unsafe {
-        SHChangeNotify(
-            SHCNE_DELETE,
-            SHCNF_PATHW | SHCNF_FLUSH,
-            wide_deleted.as_ptr() as *const c_void,
-            std::ptr::null(),
-        );
-    }
-
-    reporter.on_item_done(path, false);
-    Ok(())
+    finalize_and_delete_file(path, ro_guard, reporter)
 }
 
 pub fn shred_recursive(path: &Path, num_passes: usize, errors: &mut usize) {
@@ -2315,6 +2625,17 @@ pub fn shred_recursive_with_reporter<R: ShredReporter>(
     num_passes: usize,
     errors: &mut usize,
     reporter: &mut R,
+) {
+    let mut drive_ssd_cache = std::collections::HashMap::new();
+    shred_recursive_with_reporter_inner(path, num_passes, errors, reporter, &mut drive_ssd_cache);
+}
+
+fn shred_recursive_with_reporter_inner<R: ShredReporter>(
+    path: &Path,
+    num_passes: usize,
+    errors: &mut usize,
+    reporter: &mut R,
+    drive_ssd_cache: &mut std::collections::HashMap<String, bool>,
 ) {
     if reporter.is_cancelled() {
         return;
@@ -2341,8 +2662,8 @@ pub fn shred_recursive_with_reporter<R: ShredReporter>(
         }
     };
 
-    // KRITISCH: Symlinks und Junctions NIEMALS betreten oder das Ziel überschreiben!
-    if sym_meta.file_type().is_symlink() {
+    // KRITISCH: Andere Reparse Points / Cloud-Platzhalter NIEMALS betreten oder herunterladen!
+    if is_reparse_or_cloud_placeholder_meta(&sym_meta) {
         reporter.on_item_start(&clean_path, false);
         match secure_single_rename(&clean_path) {
             Ok(final_path) => {
@@ -2352,17 +2673,8 @@ pub fn shred_recursive_with_reporter<R: ShredReporter>(
                     *errors += 1;
                 } else {
                     ro_guard.disarm();
-                    let abs_orig = resolve_absolute_no_symlink(&clean_path);
-                    let wide_deleted = path_to_wide(&abs_orig);
                     let event = if sym_meta.is_dir() { SHCNE_RMDIR } else { SHCNE_DELETE };
-                    unsafe {
-                        SHChangeNotify(
-                            event,
-                            SHCNF_PATHW | SHCNF_FLUSH,
-                            wide_deleted.as_ptr() as *const c_void,
-                            std::ptr::null(),
-                        );
-                    }
+                    notify_shell_item_removed(&clean_path, event);
                 }
             }
             Err(e) => {
@@ -2384,9 +2696,13 @@ pub fn shred_recursive_with_reporter<R: ShredReporter>(
                         return;
                     }
                     match entry {
-                        Ok(e) => {
-                            shred_recursive_with_reporter(&e.path(), num_passes, errors, reporter)
-                        }
+                        Ok(e) => shred_recursive_with_reporter_inner(
+                            &e.path(),
+                            num_passes,
+                            errors,
+                            reporter,
+                            drive_ssd_cache,
+                        ),
                         Err(_) => *errors += 1,
                     }
                 }
@@ -2418,10 +2734,7 @@ pub fn shred_recursive_with_reporter<R: ShredReporter>(
 
         // Eventuelle Alternate Data Streams des Verzeichnisses schreddern
         let mut ro_guard = ReadonlyGuard::acquire(&clean_path);
-        let is_ssd = matches!(
-            get_drive_media_type(&clean_path),
-            DriveMediaType::SsdNvme { .. }
-        );
+        let is_ssd = is_ssd_for_path(&clean_path, drive_ssd_cache);
         if let Err(e) = shred_alternate_streams_with_reporter(&clean_path, num_passes, is_ssd, reporter) {
             if e.kind() == io::ErrorKind::Interrupted {
                 return;
@@ -2444,16 +2757,7 @@ pub fn shred_recursive_with_reporter<R: ShredReporter>(
                     );
                 } else {
                     final_ro.disarm();
-                    let abs_orig = resolve_absolute_no_symlink(&clean_path);
-                    let wide_deleted = path_to_wide(&abs_orig);
-                    unsafe {
-                        SHChangeNotify(
-                            SHCNE_RMDIR,
-                            SHCNF_PATHW | SHCNF_FLUSH,
-                            wide_deleted.as_ptr() as *const c_void,
-                            std::ptr::null(),
-                        );
-                    }
+                    notify_shell_item_removed(&clean_path, SHCNE_RMDIR);
                 }
             }
             Err(e) => {
@@ -2465,8 +2769,12 @@ pub fn shred_recursive_with_reporter<R: ShredReporter>(
             }
         }
         reporter.on_item_done(&clean_path, true);
-    } else if let Err(e) = shred_file_with_reporter(&clean_path, num_passes, reporter)
-        && e.kind() != io::ErrorKind::Interrupted
+    } else if let Err(e) = shred_file_with_reporter_cached(
+        &clean_path,
+        num_passes,
+        reporter,
+        Some(drive_ssd_cache),
+    ) && e.kind() != io::ErrorKind::Interrupted
     {
         *errors += 1;
         eprintln!("Fehler beim Schreddern der Datei {:?}: {}", clean_path, e);
@@ -2696,14 +3004,18 @@ fn run_install_backend(opt_modern: bool, opt_classic: bool, opt_sendto: bool) ->
             ps_command.push_str(&format!(
                 "Import-Certificate -FilePath '{cer}' -CertStoreLocation 'Cert:\\LocalMachine\\TrustedPeople' -ErrorAction Stop | Out-Null; \
                 $pkg = Get-AppxPackage -Name 'WinShred.ShellExtension' -ErrorAction SilentlyContinue; \
-                if ($pkg) {{ Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction SilentlyContinue }}; \
+                if ($pkg) {{ $pkg | Remove-AppxPackage -ErrorAction SilentlyContinue }}; \
                 try {{ \
                     Add-AppxPackage -Path '{msix}' -ExternalLocation '{inst}' -ErrorAction Stop; \
                 }} catch {{ \
                     [Console]::Error.WriteLine($_.Exception.Message); \
+                    exit 1; \
                 }} \
                 $verify = Get-AppxPackage -Name 'WinShred.ShellExtension' -ErrorAction SilentlyContinue; \
-                if (-not $verify) {{ [Console]::Error.WriteLine('Windows 11 Sparse-Package konnte nicht registriert werden. Stellen Sie sicher, dass Sideloading/Entwicklermodus erlaubt ist.'); }} ",
+                if (-not $verify) {{ \
+                    [Console]::Error.WriteLine('Windows 11 Sparse-Package konnte nicht registriert werden. Stellen Sie sicher, dass Sideloading/Entwicklermodus erlaubt ist.'); \
+                    exit 1; \
+                }} ",
                 cer = cer_path.to_string_lossy(),
                 msix = msix_path.to_string_lossy(),
                 inst = install_dir.to_string_lossy()
@@ -2711,29 +3023,49 @@ fn run_install_backend(opt_modern: bool, opt_classic: bool, opt_sendto: bool) ->
         } else {
             ps_command.push_str(
                 "$pkg = Get-AppxPackage -Name 'WinShred.ShellExtension' -ErrorAction SilentlyContinue; \
-                if ($pkg) { Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction SilentlyContinue }; "
+                if ($pkg) { $pkg | Remove-AppxPackage -ErrorAction SilentlyContinue }; "
             );
         }
 
-        // 5. SendTo Shortcut je nach Auswahl
+        // 5. SendTo Shortcut im Profil des aktiven Desktop-Benutzers verwalten (UAC-Kontowechsel beachten)
+        ps_command.push_str(
+            "$sendToDirs = @(); \
+            try { \
+                $activeUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName; \
+                if ($activeUser) { \
+                    $nt = New-Object System.Security.Principal.NTAccount($activeUser); \
+                    $sid = $nt.Translate([System.Security.Principal.SecurityIdentifier]).Value; \
+                    $prof = (Get-ItemProperty -Path \"HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\$sid\" -ErrorAction SilentlyContinue).ProfileImagePath; \
+                    if ($prof) { \
+                        $candidate = [System.IO.Path]::Combine($prof, 'AppData\\Roaming\\Microsoft\\Windows\\SendTo'); \
+                        if (Test-Path $candidate) { $sendToDirs += $candidate }; \
+                    } \
+                } \
+            } catch {}; \
+            $fallbackSendTo = [System.IO.Path]::Combine($env:APPDATA, 'Microsoft\\Windows\\SendTo'); \
+            if ($sendToDirs -notcontains $fallbackSendTo) { $sendToDirs += $fallbackSendTo }; "
+        );
         if opt_sendto {
             ps_command.push_str(&format!(
                 "try {{ \
                     $wsh = New-Object -ComObject WScript.Shell; \
-                    $s = $wsh.CreateShortcut(\"$env:APPDATA\\Microsoft\\Windows\\SendTo\\WinShred (Sicher vernichten).lnk\"); \
+                    $targetDir = $sendToDirs[0]; \
+                    if (-not (Test-Path $targetDir)) {{ New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }}; \
+                    $s = $wsh.CreateShortcut([System.IO.Path]::Combine($targetDir, 'WinShred (Sicher vernichten).lnk')); \
                     $s.TargetPath = '{inst}\\winshred.exe'; \
                     $s.IconLocation = '{ico}'; \
                     $s.Save(); \
-                }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); }} ",
+                }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1; }} ",
                 inst = install_dir.to_string_lossy(),
                 ico = ico_path.to_string_lossy()
             ));
-        } else if let Ok(appdata) = env::var("APPDATA") {
-            let lnk = PathBuf::from(appdata).join(r"Microsoft\Windows\SendTo\WinShred (Sicher vernichten).lnk");
-            if lnk.exists() {
-                fs::remove_file(&lnk)
-                    .map_err(|e| format!("Fehler beim Entfernen der SendTo-Verknuepfung:\n{}", e))?;
-            }
+        } else {
+            ps_command.push_str(
+                "foreach ($d in $sendToDirs) { \
+                    $lnk = [System.IO.Path]::Combine($d, 'WinShred (Sicher vernichten).lnk'); \
+                    if (Test-Path $lnk) { Remove-Item -Path $lnk -Force -ErrorAction Stop }; \
+                } "
+            );
         }
 
         let output = Command::new("powershell")
@@ -2752,7 +3084,7 @@ fn run_install_backend(opt_modern: bool, opt_classic: bool, opt_sendto: bool) ->
 
         // 6. Klassisches Menue (statische Registry-Keys)
         let ico_str = ico_path.to_string_lossy().to_string();
-        let cmd_str = format!("\"{}\" \"%1\"", target_exe.to_string_lossy());
+        let cmd_str = format!("\"{}\" -- \"%1\"", target_exe.to_string_lossy());
 
         if opt_classic {
             run_reg(&["add", r"HKLM\SOFTWARE\Classes\*\shell\WinShred", "/ve", "/d", "Mit WinShred sicher vernichten", "/f"])?;
@@ -2808,14 +3140,31 @@ fn run_install_backend(opt_modern: bool, opt_classic: bool, opt_sendto: bool) ->
 fn run_uninstall_backend() -> Result<(), String> {
     let mut errors: Vec<String> = Vec::new();
 
-    // 1. PowerShell: Explorer & dllhost stoppen, AppX-Paket und Zertifikat löschen
+    // 1. PowerShell: Explorer & dllhost stoppen, AppX-Paket, Zertifikat und SendTo-Link löschen
     let ps_command = "\
         $ProgressPreference = 'SilentlyContinue'; \
         Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue; \
         Get-CimInstance Win32_Process -Filter \"Name = 'dllhost.exe'\" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*8a76b81c-0a87-4348-9f7c-79f8815e7c81*' } | Stop-Process -Force -ErrorAction SilentlyContinue; \
         $pkg = Get-AppxPackage -Name 'WinShred.ShellExtension' -ErrorAction SilentlyContinue; \
-        if ($pkg) { Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction Stop }; \
-        Get-ChildItem Cert:\\LocalMachine\\TrustedPeople -ErrorAction SilentlyContinue | Where-Object { $_.Subject -match 'CN=WinShred' } | Remove-Item -Force -ErrorAction Stop;";
+        if ($pkg) { $pkg | Remove-AppxPackage -ErrorAction Stop }; \
+        Get-ChildItem Cert:\\LocalMachine\\TrustedPeople -ErrorAction SilentlyContinue | Where-Object { $_.Subject -match 'CN=WinShred' } | Remove-Item -Force -ErrorAction Stop; \
+        $sendToDirs = @([System.IO.Path]::Combine($env:APPDATA, 'Microsoft\\Windows\\SendTo')); \
+        try { \
+            $activeUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName; \
+            if ($activeUser) { \
+                $nt = New-Object System.Security.Principal.NTAccount($activeUser); \
+                $sid = $nt.Translate([System.Security.Principal.SecurityIdentifier]).Value; \
+                $prof = (Get-ItemProperty -Path \"HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\$sid\" -ErrorAction SilentlyContinue).ProfileImagePath; \
+                if ($prof) { \
+                    $uSendTo = [System.IO.Path]::Combine($prof, 'AppData\\Roaming\\Microsoft\\Windows\\SendTo'); \
+                    if ($sendToDirs -notcontains $uSendTo) { $sendToDirs += $uSendTo }; \
+                } \
+            } \
+        } catch {}; \
+        foreach ($d in $sendToDirs) { \
+            $lnk = [System.IO.Path]::Combine($d, 'WinShred (Sicher vernichten).lnk'); \
+            if (Test-Path $lnk) { Remove-Item -Path $lnk -Force -ErrorAction Stop }; \
+        };";
 
     match Command::new("powershell")
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
@@ -4778,7 +5127,7 @@ fn count_items_and_bytes(paths: &[PathBuf], num_passes: usize, cancel_flag: &Ato
             Err(_) => return,
         };
         *items += 1;
-        if sym_meta.file_type().is_symlink() {
+        if is_reparse_or_cloud_placeholder_meta(&sym_meta) {
             return;
         }
         if sym_meta.is_dir() {
@@ -4791,13 +5140,7 @@ fn count_items_and_bytes(paths: &[PathBuf], num_passes: usize, cancel_flag: &Ato
                 }
             }
         } else {
-            let is_ssd = if let Some(drive) = extract_drive_letter(path) {
-                *drive_ssd_cache.entry(drive).or_insert_with(|| {
-                    matches!(get_drive_media_type(path), DriveMediaType::SsdNvme { .. })
-                })
-            } else {
-                matches!(get_drive_media_type(path), DriveMediaType::SsdNvme { .. })
-            };
+            let is_ssd = is_ssd_for_path(path, drive_ssd_cache);
             *bytes += estimate_file_wipe_bytes(path, sym_meta.len(), num_passes, is_ssd);
         }
     }
@@ -4826,6 +5169,23 @@ pub struct ShredOutcome {
     pub journal_purged: bool,
     pub journal_errors: usize,
     pub journal_error_details: Vec<String>,
+}
+
+fn format_progress_mode_detail(has_ssd: bool, has_hdd: bool, num_passes: usize) -> String {
+    if has_ssd && !has_hdd {
+        String::from("SSD / NVMe: Flash-optimiertes Wiping & Hardware-TRIM")
+    } else if has_hdd && !has_ssd {
+        let effective = num_passes.max(1);
+        if effective == 1 {
+            String::from("HDD: 1-Pass Krypto-Zufall (NIST SP 800-88 konform)")
+        } else if effective == 3 {
+            String::from("HDD: 3-Pass DoD 5220.22-M Wiping")
+        } else {
+            format!("HDD: {}-Pass Überschreiben (Krypto-Zufall zuletzt)", effective)
+        }
+    } else {
+        String::from("Adaptive medienspezifische Vernichtung")
+    }
 }
 
 struct ShredProgressShared {
@@ -5140,17 +5500,7 @@ pub fn show_shred_progress_dialog(
 
         // Medientyp für Statusanzeige ermitteln (gecached pro Laufwerk)
         let (has_ssd, has_hdd) = summarize_media_types(paths);
-        let mode_detail = if has_ssd && !has_hdd {
-            "SSD / NVMe: Flash-optimiertes Wiping & Hardware-TRIM"
-        } else if has_hdd && !has_ssd {
-            if num_passes > 1 {
-                "HDD: 3-Pass DoD 5220.22-M Wiping"
-            } else {
-                "HDD: 1-Pass Krypto-Zufall (NIST SP 800-88 konform)"
-            }
-        } else {
-            "Adaptive medienspezifische Vernichtung"
-        };
+        let mode_detail = format_progress_mode_detail(has_ssd, has_hdd, num_passes);
 
         // Header Labels (Weiss)
         PROG_CTRLS.lbl_title = create_ctrl(
@@ -5178,7 +5528,7 @@ pub fn show_shred_progress_dialog(
 
         // Detail Label (SSD / HDD Mode)
         PROG_CTRLS.lbl_detail = create_ctrl(
-            0, "STATIC", mode_detail,
+            0, "STATIC", &mode_detail,
             WS_CHILD | WS_VISIBLE, 25, 146, 345, 30, hwnd, 0, H_FONT_REGULAR,
         );
 
@@ -5197,7 +5547,7 @@ pub fn show_shred_progress_dialog(
             total_bytes: 0,
             processed_bytes: 0,
             current_item: "Vorbereitung...".to_string(),
-            detail_status: mode_detail.to_string(),
+            detail_status: mode_detail,
             cancelled: false,
             completed: false,
             errors: 0,
@@ -5216,7 +5566,34 @@ pub fn show_shred_progress_dialog(
         let shared_clone = Arc::clone(&shared);
         let hwnd_usize = hwnd as usize;
 
+        struct WorkerDoneGuard {
+            shared: Arc<Mutex<ShredProgressShared>>,
+            hwnd_usize: usize,
+            completed_normally: bool,
+        }
+
+        impl Drop for WorkerDoneGuard {
+            fn drop(&mut self) {
+                if !self.completed_normally {
+                    if let Ok(mut g) = self.shared.lock()
+                        && !g.completed
+                    {
+                        g.errors = g.errors.saturating_add(1);
+                        g.completed = true;
+                    }
+                    unsafe {
+                        PostMessageW(self.hwnd_usize as *mut c_void, WM_APP_SHRED_DONE, 0, 0);
+                    }
+                }
+            }
+        }
+
         let worker_handle = std::thread::spawn(move || {
+            let mut done_guard = WorkerDoneGuard {
+                shared: Arc::clone(&shared_clone),
+                hwnd_usize,
+                completed_normally: false,
+            };
             let hwnd = hwnd_usize as *mut c_void;
 
             // 1. Pre-Scan: Zähle Elemente und Gesamt-Bytes
@@ -5239,6 +5616,7 @@ pub fn show_shred_progress_dialog(
                     g.completed = true;
                 }
                 PostMessageW(hwnd, WM_APP_SHRED_DONE, 0, 0);
+                done_guard.completed_normally = true;
                 return;
             }
 
@@ -5312,6 +5690,7 @@ pub fn show_shred_progress_dialog(
                 std::thread::sleep(std::time::Duration::from_millis(150));
             }
             PostMessageW(hwnd, WM_APP_SHRED_DONE, 0, 0);
+            done_guard.completed_normally = true;
         });
 
         // Message Loop
@@ -5462,6 +5841,28 @@ where
         }
     }
 
+    if !parsed.show_help {
+        let mode_count =
+            parsed.install as u8 + parsed.uninstall as u8 + parsed.reset_prompts as u8;
+        if mode_count > 1 {
+            return Err(String::from(
+                "Die Optionen --install, --uninstall und --reset-prompts schliessen sich gegenseitig aus.",
+            ));
+        }
+        if mode_count == 1
+            && (!parsed.raw_paths.is_empty()
+                || !parsed.filelists.is_empty()
+                || parsed.custom_passes.is_some()
+                || parsed.purge_journal
+                || parsed.skip_prompt_checked
+                || (parsed.auto_confirm && !parsed.is_quiet))
+        {
+            return Err(String::from(
+                "Installations-, Deinstallations- und Reset-Optionen duerfen nicht mit Dateipfaden oder Shred-Optionen kombiniert werden.",
+            ));
+        }
+    }
+
     Ok(parsed)
 }
 
@@ -5496,7 +5897,7 @@ fn deduplicate_and_prune_nested_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
             let norm = normalize_win_path_for_compare(&path, false);
             let fs_path = to_fs_path(&path);
             let is_real_dir = fs::symlink_metadata(fs_path.as_ref())
-                .map(|m| !m.file_type().is_symlink() && m.is_dir())
+                .map(|m| !is_reparse_dir_meta(&m) && m.is_dir())
                 .unwrap_or(false);
             Entry {
                 path,
@@ -6946,6 +7347,125 @@ mod tests {
         }
         let est = estimate_file_wipe_bytes(&fpath, 5, 1, true);
         assert_eq!(est, 15, "Hauptstream (5) + ADS (10) = 15 erwartet");
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_hardlink_unlink_preserves_other_link() {
+        let temp_dir = env::temp_dir().join(format!("winshred_hardlink_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let orig = temp_dir.join("original.bin");
+        let link = temp_dir.join("hardlink.bin");
+        let payload = b"Vertrauliche Daten fuer Hardlink-Test 1234567890";
+        fs::write(&orig, payload).unwrap();
+        fs::hard_link(&orig, &link).unwrap();
+
+        let est = estimate_file_wipe_bytes(&link, payload.len() as u64, 3, false);
+        assert_eq!(est, 0, "Hardlink (nlink > 1) darf nicht als zu überschreibende Payload geschätzt werden");
+
+        let mut errs = 0;
+        shred_recursive(&link, 3, &mut errs);
+        assert_eq!(errs, 0);
+        assert!(!link.exists(), "Der geschredderte Hardlink-Eintrag muss entfernt sein");
+        assert!(orig.exists(), "Der zweite Hardlink muss erhalten bleiben");
+        assert_eq!(
+            fs::read(&orig).unwrap(),
+            payload,
+            "Die Daten des zweiten Hardlinks dürfen nicht überschrieben oder gekürzt worden sein"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_path_safety_gaps_blocked_and_important() {
+        assert!(matches!(
+            classify_path_safety(Path::new(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\EFI")),
+            PathSafetyLevel::Blocked(_)
+        ));
+        assert!(matches!(
+            classify_path_safety(Path::new(r"\\localhost\C$\Windows\System32")),
+            PathSafetyLevel::Blocked(_)
+        ));
+        assert!(matches!(
+            classify_path_safety(Path::new(r"\\.\C:\Windows")),
+            PathSafetyLevel::Blocked(_)
+        ));
+        assert!(matches!(
+            classify_path_safety(Path::new(r"\\.\GLOBALROOT\Device\HarddiskVolume1\Windows")),
+            PathSafetyLevel::Blocked(_)
+        ));
+        assert!(matches!(
+            classify_path_safety(Path::new(r"C:\Users\Public\Documents\test.txt")),
+            PathSafetyLevel::Important(_)
+        ));
+    }
+
+    #[test]
+    fn test_to_fs_path_adds_verbatim_for_trailing_dot_and_reserved() {
+        let trailing_dot = to_fs_path(Path::new(r"C:\Temp\datei."));
+        assert!(
+            trailing_dot.to_string_lossy().starts_with(r"\\?\"),
+            "Pfad mit abschließendem Punkt benötigt Verbatim-Präfix: {:?}",
+            trailing_dot
+        );
+        let reserved = to_fs_path(Path::new(r"C:\Temp\CON"));
+        assert!(
+            reserved.to_string_lossy().starts_with(r"\\?\"),
+            "Reservierter DOS-Name benötigt Verbatim-Präfix: {:?}",
+            reserved
+        );
+        let normal = to_fs_path(Path::new(r"C:\Temp\normal.txt"));
+        assert!(!normal.to_string_lossy().starts_with(r"\\?\"));
+    }
+
+    #[test]
+    fn test_cli_conflicting_mode_flags_and_paths_rejected() {
+        assert!(parse_cli_args(["--install", "--uninstall"]).is_err());
+        assert!(parse_cli_args(["--install", "--reset-prompts"]).is_err());
+        assert!(parse_cli_args(["--install", "datei.txt"]).is_err());
+        assert!(parse_cli_args(["--uninstall", "--passes", "3"]).is_err());
+        assert!(parse_cli_args(["--reset-prompts", "-y"]).is_err());
+        assert!(parse_cli_args(["--install", "--quiet"]).is_ok());
+        assert!(parse_cli_args(["--uninstall", "--quiet"]).is_ok());
+    }
+
+    #[test]
+    fn test_format_progress_mode_detail_dynamic_passes() {
+        assert!(format_progress_mode_detail(false, true, 1).contains("1-Pass"));
+        assert!(format_progress_mode_detail(false, true, 3).contains("3-Pass DoD"));
+        assert!(format_progress_mode_detail(false, true, 5).contains("5-Pass"));
+        assert!(format_progress_mode_detail(true, false, 7).contains("SSD / NVMe"));
+    }
+
+    #[test]
+    fn test_preallocated_zero_byte_file_estimated_and_shredded() {
+        let temp_dir = env::temp_dir().join(format!("winshred_prealloc_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let fpath = temp_dir.join("prealloc.bin");
+        {
+            let mut f = OpenOptions::new()
+                .write(true)
+                .read(true)
+                .create(true)
+                .truncate(true)
+                .open(&fpath)
+                .unwrap();
+            f.write_all(&vec![0xAAu8; 8192]).unwrap();
+            f.flush().unwrap();
+            // Allocation über FileAllocationInfo explizit reservieren (EOF bleibt 0 oder non-zero check)
+            f.set_len(0).unwrap();
+            let est = estimate_file_wipe_bytes(&fpath, 0, 1, false);
+            assert!(
+                est >= 8192,
+                "Vorallokierte 0-Byte-Datei muss ihre allokierten Cluster (>0) schaetzen: {}",
+                est
+            );
+        }
+        let mut errs = 0;
+        shred_recursive(&fpath, 1, &mut errs);
+        assert_eq!(errs, 0);
+        assert!(!fpath.exists());
         let _ = fs::remove_dir_all(&temp_dir);
     }
 }

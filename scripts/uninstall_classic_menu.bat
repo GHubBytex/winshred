@@ -25,10 +25,15 @@ reg delete "HKCR\Directory\shell\WinShred" /f >nul 2>&1
 
 echo [2/3] Entferne Senden-an (SendTo) Verknuepfung...
 del /f /q "%APPDATA%\Microsoft\Windows\SendTo\WinShred (Sicher vernichten).lnk" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $u = (Get-CimInstance Win32_ComputerSystem).UserName; if ($u) { $sid = (New-Object System.Security.Principal.NTAccount($u)).Translate([System.Security.Principal.SecurityIdentifier]).Value; $p = (Get-ItemProperty -Path \"HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid\").ProfileImagePath; if ($p) { $f = Join-Path $p 'AppData\Roaming\Microsoft\Windows\SendTo\WinShred (Sicher vernichten).lnk'; if (Test-Path $f) { Remove-Item -Path $f -Force } } } } catch {}" >nul 2>&1
 
 echo [3/3] Starte Windows Explorer neu...
 taskkill /f /im explorer.exe >nul 2>&1
-start explorer.exe
+ping -n 3 127.0.0.1 >nul
+tasklist /fi "imagename eq explorer.exe" 2>nul | find /i "explorer.exe" >nul
+if errorlevel 1 (
+    runas /trustlevel:0x20000 explorer.exe >nul 2>&1 || start "" explorer.exe
+)
 
 echo.
 echo ======================================================================
