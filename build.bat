@@ -40,6 +40,11 @@ echo.
 if exist "assets\icon.png" (
     echo [1/6] Generiere Icons aus assets\icon.png...
     python assets\generate_icons.py
+    if !errorlevel! neq 0 (
+        echo [FEHLER] Icon-Generierung fehlgeschlagen!
+        pause
+        exit /b 1
+    )
 )
 
 :: 4. Zertifikat pruefen oder erstellen

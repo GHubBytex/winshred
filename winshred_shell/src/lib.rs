@@ -320,14 +320,49 @@ unsafe extern "system" fn cmd_get_canonical_name(
 
 unsafe extern "system" fn cmd_get_state(
     _this: *mut WinShredCommand,
-    _items: *mut c_void,
+    items: *mut c_void,
     _ok_slow: i32,
     p_cmd_state: *mut u32,
 ) -> HRESULT {
     if p_cmd_state.is_null() {
         return E_POINTER;
     }
-    *p_cmd_state = 0; // ECS_ENABLED
+    const ECS_ENABLED: u32 = 0;
+    const ECS_HIDDEN: u32 = 2;
+
+    if items.is_null() {
+        *p_cmd_state = ECS_ENABLED;
+        return S_OK;
+    }
+
+    let array = items as *mut *mut IShellItemArrayVtbl;
+    let vtbl = &**array;
+    let mut count: u32 = 0;
+    if (vtbl.get_count)(items, &mut count) == S_OK && count > 0 {
+        for i in 0..count {
+            let mut shell_item: *mut c_void = std::ptr::null_mut();
+            if (vtbl.get_item_at)(items, i, &mut shell_item) == S_OK && !shell_item.is_null() {
+                let item_ptr = shell_item as *mut *mut IShellItemVtbl;
+                let item_vtbl = &**item_ptr;
+                let mut path_ptr: *mut u16 = std::ptr::null_mut();
+                let has_fs_path = (item_vtbl.get_display_name)(shell_item, SIGDN_FILESYSPATH, &mut path_ptr)
+                    == S_OK
+                    && !path_ptr.is_null();
+                if !path_ptr.is_null() {
+                    CoTaskMemFree(path_ptr as *mut c_void);
+                }
+                (item_vtbl.release)(shell_item);
+                if has_fs_path {
+                    *p_cmd_state = ECS_ENABLED;
+                    return S_OK;
+                }
+            }
+        }
+        *p_cmd_state = ECS_HIDDEN;
+        return S_OK;
+    }
+
+    *p_cmd_state = ECS_ENABLED;
     S_OK
 }
 
@@ -496,10 +531,14 @@ unsafe extern "system" fn factory_create_instance(
     riid: *const GUID,
     ppv: *mut *mut c_void,
 ) -> HRESULT {
+    if ppv.is_null() {
+        return E_POINTER;
+    }
+    *ppv = std::ptr::null_mut();
     if !punk_outer.is_null() {
         return CLASS_E_NOAGGREGATION;
     }
-    if ppv.is_null() || riid.is_null() {
+    if riid.is_null() {
         return E_POINTER;
     }
 

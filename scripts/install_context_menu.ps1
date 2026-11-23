@@ -33,26 +33,35 @@ $iconPath = "%SystemRoot%\System32\imageres.dll,-5308" # Windows Shredder / Papi
 
 Write-Host "Registriere WinShred im Kontextmenue..." -ForegroundColor Green
 
-# 1. Dateien (*)
-$fileKey = "HKCU:\Software\Classes\*\shell\WinShred"
+# 1. Dateien (*) – systemweit in HKLM (passend zur UAC-Elevation)
+$fileKey = "HKLM:\SOFTWARE\Classes\*\shell\WinShred"
 New-Item -Path $fileKey -Force | Out-Null
 Set-ItemProperty -Path $fileKey -Name "(Default)" -Value "Mit WinShred sicher vernichten"
 Set-ItemProperty -Path $fileKey -Name "Icon" -Value $iconPath
 $fileCmdKey = "$fileKey\command"
 New-Item -Path $fileCmdKey -Force | Out-Null
-Set-ItemProperty -Path $fileCmdKey -Name "(Default)" -Value "`"$exePath`" `"%1`""
+Set-ItemProperty -Path $fileCmdKey -Name "(Default)" -Value "`"$exePath`" -- `"%1`""
 
-# 2. Ordner (Directory)
-$dirKey = "HKCU:\Software\Classes\Directory\shell\WinShred"
+# 2. Ordner (Directory) – systemweit in HKLM
+$dirKey = "HKLM:\SOFTWARE\Classes\Directory\shell\WinShred"
 New-Item -Path $dirKey -Force | Out-Null
 Set-ItemProperty -Path $dirKey -Name "(Default)" -Value "Mit WinShred sicher vernichten"
 Set-ItemProperty -Path $dirKey -Name "Icon" -Value $iconPath
 $dirCmdKey = "$dirKey\command"
 New-Item -Path $dirCmdKey -Force | Out-Null
-Set-ItemProperty -Path $dirCmdKey -Name "(Default)" -Value "`"$exePath`" `"%1`""
+Set-ItemProperty -Path $dirCmdKey -Name "(Default)" -Value "`"$exePath`" -- `"%1`""
 
-# 3. 'Senden an' (SendTo) Menü Verknüpfung
-$sendToPath = [System.IO.Path]::Combine($env:APPDATA, 'Microsoft\Windows\SendTo')
+# 3. 'Senden an' (SendTo) Menü Verknüpfung (bevorzugt Profil des interaktiven Desktop-Benutzers)
+$sendToBase = $env:APPDATA
+try {
+    $loggedUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName
+    if ($loggedUser) {
+        $sam = ($loggedUser -split '\\')[-1]
+        $userAppData = Join-Path "C:\Users\$sam" "AppData\Roaming"
+        if (Test-Path $userAppData) { $sendToBase = $userAppData }
+    }
+} catch {}
+$sendToPath = [System.IO.Path]::Combine($sendToBase, 'Microsoft\Windows\SendTo')
 if (Test-Path $sendToPath) {
     $wshShell = New-Object -ComObject WScript.Shell
     $shortcutPath = Join-Path $sendToPath "WinShred (Sicher vernichten).lnk"
