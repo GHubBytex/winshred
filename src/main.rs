@@ -9,7 +9,7 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -195,6 +195,54 @@ unsafe extern "system" {
     fn SwitchToThisWindow(hWnd: *mut c_void, fUnknown: i32);
     fn SetActiveWindow(hWnd: *mut c_void) -> *mut c_void;
     fn AllowSetForegroundWindow(dwProcessId: u32) -> i32;
+    fn IsDialogMessageW(hDlg: *mut c_void, lpMsg: *const MSG) -> i32;
+    fn SetTimer(
+        hWnd: *mut c_void,
+        nIDEvent: usize,
+        uElapse: u32,
+        lpTimerFunc: *mut c_void,
+    ) -> usize;
+    fn KillTimer(hWnd: *mut c_void, uIDEvent: usize) -> i32;
+}
+
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn RegOpenKeyExW(
+        hKey: *mut c_void,
+        lpSubKey: *const u16,
+        ulOptions: u32,
+        samDesired: u32,
+        phkResult: *mut *mut c_void,
+    ) -> i32;
+    fn RegCreateKeyExW(
+        hKey: *mut c_void,
+        lpSubKey: *const u16,
+        Reserved: u32,
+        lpClass: *mut u16,
+        dwOptions: u32,
+        samDesired: u32,
+        lpSecurityAttributes: *mut c_void,
+        phkResult: *mut *mut c_void,
+        lpdwDisposition: *mut u32,
+    ) -> i32;
+    fn RegQueryValueExW(
+        hKey: *mut c_void,
+        lpValueName: *const u16,
+        lpReserved: *mut u32,
+        lpType: *mut u32,
+        lpData: *mut u8,
+        lpcbData: *mut u32,
+    ) -> i32;
+    fn RegSetValueExW(
+        hKey: *mut c_void,
+        lpValueName: *const u16,
+        Reserved: u32,
+        dwType: u32,
+        lpData: *const u8,
+        cbData: u32,
+    ) -> i32;
+    fn RegDeleteValueW(hKey: *mut c_void, lpValueName: *const u16) -> i32;
+    fn RegCloseKey(hKey: *mut c_void) -> i32;
 }
 
 #[link(name = "shell32")]
@@ -273,8 +321,12 @@ struct DEVICE_TRIM_DESCRIPTOR {
 #[repr(C)]
 struct USN_JOURNAL_DATA_V0 {
     usn_journal_id: u64,
-    allocation_delta: u64,
+    first_usn: i64,
+    next_usn: i64,
+    lowest_valid_usn: i64,
+    max_usn: i64,
     maximum_size: u64,
+    allocation_delta: u64,
 }
 
 #[repr(C)]
@@ -327,7 +379,13 @@ unsafe extern "system" {
         lpTotalNumberOfClusters: *mut u32,
     ) -> i32;
 
+    fn GetFileAttributesW(lpFileName: *const u16) -> u32;
     fn SetFileAttributesW(lpFileName: *const u16, dwFileAttributes: u32) -> i32;
+    fn MoveFileExW(
+        lpExistingFileName: *const u16,
+        lpNewFileName: *const u16,
+        dwFlags: u32,
+    ) -> i32;
 
     fn CreateFileW(
         lpFileName: *const u16,
@@ -365,10 +423,18 @@ const STORAGE_DEVICE_TRIM_PROPERTY: u32 = 8;
 const PROPERTY_STANDARD_QUERY: u32 = 0;
 
 const FSCTL_GET_RETRIEVAL_POINTERS: u32 = 0x00090073;
+const FSCTL_QUERY_ALLOCATED_RANGES: u32 = 0x000940CF;
 const FSCTL_QUERY_USN_JOURNAL: u32 = 0x000900F4;
-const FSCTL_DELETE_USN_JOURNAL: u32 = 0x00090064;
+const FSCTL_DELETE_USN_JOURNAL: u32 = 0x000900F8;
 const FSCTL_CREATE_USN_JOURNAL: u32 = 0x000900e7;
 const USN_DELETE_FLAG_DELETE: u32 = 0x00000001;
+
+const ERROR_INVALID_FUNCTION: u32 = 1;
+const ERROR_HANDLE_EOF: u32 = 38;
+const ERROR_FILE_EXISTS: u32 = 80;
+const ERROR_ALREADY_EXISTS: u32 = 183;
+const ERROR_MORE_DATA: u32 = 234;
+const ERROR_JOURNAL_NOT_ACTIVE: u32 = 1179;
 
 const FILE_STANDARD_INFO_CLASS: u32 = 1;
 
@@ -397,8 +463,18 @@ const IDYES: i32 = 6;
 const SHCNE_ALLEVENTS: i32 = 0x7FFFFFFF;
 const SHCNF_PATHW: u32 = 0x0005;
 const SHCNF_FLUSH: u32 = 0x1000;
+const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFFFFFF;
+const FILE_ATTRIBUTE_READONLY: u32 = 0x00000001;
+#[cfg(test)]
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x00000080;
+const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x00000200;
 const IDC_WAIT: usize = 32514;
+const LR_SHARED: u32 = 0x00008000;
+
+const HKEY_CURRENT_USER: *mut c_void = (-2147483647i32 as isize) as *mut c_void;
+const KEY_READ: u32 = 0x00020019;
+const KEY_WRITE: u32 = 0x00020006;
+const REG_DWORD: u32 = 4;
 
 const FSCTL_FILE_LEVEL_TRIM: u32 = 0x00098208;
 
@@ -526,17 +602,70 @@ fn fill_random_bytes(buf: &mut [u8]) -> io::Result<()> {
 // Shredder Logik (Slack, ADS, TRIM, MFT-Wipe)
 // ==========================================
 
+/// RAII-Wrapper für rohe Win32-Handles, der beim Verlassen des Scopes `CloseHandle` aufruft.
+struct OwnedHandle(*mut c_void);
+
+impl OwnedHandle {
+    fn from_raw(handle: *mut c_void) -> Option<Self> {
+        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+            None
+        } else {
+            Some(Self(handle))
+        }
+    }
+
+    fn as_raw(&self) -> *mut c_void {
+        self.0
+    }
+}
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+/// Löst relative Pfade sowie `.` und `..` auf, ohne Symlinks oder Junctions aufzulösen.
+fn resolve_absolute_no_symlink(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| {
+        if path.is_relative() {
+            env::current_dir()
+                .map(|cd| cd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        } else {
+            path.to_path_buf()
+        }
+    })
+}
+
+/// Extrahiert den normalisierten Laufwerksbuchstaben (z. B. `"C:"`) für einen lokalen Pfad.
+fn extract_drive_letter(path: &Path) -> Option<String> {
+    let abs_path = resolve_absolute_no_symlink(path);
+    match abs_path.components().next() {
+        Some(std::path::Component::Prefix(prefix)) => {
+            let s = prefix.as_os_str().to_string_lossy();
+            let trimmed = s.trim_start_matches(r"\\?\").trim_end_matches('\\');
+            if trimmed.len() == 2 && trimmed.ends_with(':') {
+                Some(trimmed.to_ascii_uppercase())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn get_cluster_size(path: &Path) -> u64 {
     let mut sectors_per_cluster: u32 = 0;
     let mut bytes_per_sector: u32 = 0;
     let mut free_clusters: u32 = 0;
     let mut total_clusters: u32 = 0;
 
-    let abs_path = if path.is_relative() {
-        env::current_dir().map(|cd| cd.join(path)).unwrap_or_else(|_| path.to_path_buf())
-    } else {
-        path.to_path_buf()
-    };
+    let abs_path = resolve_absolute_no_symlink(path);
 
     let root_path = abs_path.components().next().map(|c| {
         let mut p = PathBuf::from(c.as_os_str());
@@ -580,29 +709,14 @@ pub enum DriveMediaType {
 }
 
 pub fn get_drive_media_type(path: &Path) -> DriveMediaType {
-    let abs_path = if path.is_relative() {
-        env::current_dir().map(|cd| cd.join(path)).unwrap_or_else(|_| path.to_path_buf())
-    } else {
-        path.to_path_buf()
-    };
-
-    let drive_letter = match abs_path.components().next() {
-        Some(std::path::Component::Prefix(prefix)) => {
-            let s = prefix.as_os_str().to_string_lossy();
-            let trimmed = s.trim_start_matches(r"\\?\").trim_end_matches('\\');
-            if trimmed.len() >= 2 && trimmed.ends_with(':') {
-                trimmed.to_string()
-            } else {
-                return DriveMediaType::Unknown;
-            }
-        }
-        _ => return DriveMediaType::Unknown,
+    let Some(drive_letter) = extract_drive_letter(path) else {
+        return DriveMediaType::Unknown;
     };
 
     let volume_path = format!(r"\\.\{}", drive_letter);
     let wide_vol = to_wide_chars(&volume_path);
 
-    let handle = unsafe {
+    let Some(handle) = OwnedHandle::from_raw(unsafe {
         CreateFileW(
             wide_vol.as_ptr(),
             0, // Keine Lese-/Schreibberechtigung für Property-Queries nötig!
@@ -612,11 +726,9 @@ pub fn get_drive_media_type(path: &Path) -> DriveMediaType {
             0,
             std::ptr::null_mut(),
         )
-    };
-
-    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+    }) else {
         return DriveMediaType::Unknown;
-    }
+    };
 
     let query = STORAGE_PROPERTY_QUERY {
         property_id: STORAGE_DEVICE_SEEK_PENALTY_PROPERTY,
@@ -633,7 +745,7 @@ pub fn get_drive_media_type(path: &Path) -> DriveMediaType {
 
     let success = unsafe {
         DeviceIoControl(
-            handle,
+            handle.as_raw(),
             IOCTL_STORAGE_QUERY_PROPERTY,
             &query as *const _ as *const c_void,
             std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
@@ -645,7 +757,6 @@ pub fn get_drive_media_type(path: &Path) -> DriveMediaType {
     };
 
     if success == 0 {
-        unsafe { CloseHandle(handle); }
         return DriveMediaType::Unknown;
     }
 
@@ -662,7 +773,7 @@ pub fn get_drive_media_type(path: &Path) -> DriveMediaType {
     };
     let trim_success = unsafe {
         DeviceIoControl(
-            handle,
+            handle.as_raw(),
             IOCTL_STORAGE_QUERY_PROPERTY,
             &trim_query as *const _ as *const c_void,
             std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
@@ -673,8 +784,6 @@ pub fn get_drive_media_type(path: &Path) -> DriveMediaType {
         )
     };
 
-    unsafe { CloseHandle(handle); }
-
     let trim_supported = trim_success != 0 && trim_desc.trim_enabled != 0;
 
     if seek_penalty.incurs_seek_penalty == 0 {
@@ -684,6 +793,7 @@ pub fn get_drive_media_type(path: &Path) -> DriveMediaType {
     }
 }
 
+/// Prüft, ob die Daten einer Datei direkt resident im NTFS-MFT-Eintrag gespeichert sind.
 pub fn is_file_resident_in_mft(file: &fs::File, len: u64) -> bool {
     if len == 0 {
         return true;
@@ -693,7 +803,53 @@ pub fn is_file_resident_in_mft(file: &fs::File, len: u64) -> bool {
         return false;
     }
 
-    let handle = file.as_raw_handle() as *mut c_void;
+    let handle = file.as_raw_handle();
+
+    // Primäre Verifikation über FSCTL_GET_RETRIEVAL_POINTERS:
+    // Residente NTFS-Streams haben (auch wenn FileStandardInfo.AllocationSize > 0, z. B. 32 Bytes meldet)
+    // keinerlei physische Cluster-Extents und liefern ERROR_HANDLE_EOF (38) oder extent_count == 0.
+    #[repr(C)]
+    struct StartingVcnInputBuffer {
+        starting_vcn: i64,
+    }
+    #[repr(C)]
+    struct RetrievalPointersBuffer {
+        extent_count: u32,
+        starting_vcn: i64,
+        extents: [u64; 2],
+    }
+
+    let in_buf = StartingVcnInputBuffer { starting_vcn: 0 };
+    let mut out_buf: RetrievalPointersBuffer = unsafe { std::mem::zeroed() };
+    let mut bytes_ret = 0u32;
+
+    let c_ret = unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_GET_RETRIEVAL_POINTERS,
+            &in_buf as *const _ as *const c_void,
+            std::mem::size_of::<StartingVcnInputBuffer>() as u32,
+            &mut out_buf as *mut _ as *mut c_void,
+            std::mem::size_of::<RetrievalPointersBuffer>() as u32,
+            &mut bytes_ret,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if c_ret != 0 {
+        return out_buf.extent_count == 0;
+    }
+
+    let err = unsafe { GetLastError() };
+    if err == ERROR_HANDLE_EOF {
+        return true;
+    }
+    if err == ERROR_MORE_DATA {
+        return false;
+    }
+
+    // Fallback nur, wenn Retrieval-Pointers nicht unterstützt werden:
+    // Auf NTFS meldet dann höchstens AllocationSize == 0 eine residente Datei.
     let mut std_info = FILE_STANDARD_INFO {
         allocation_size: 0,
         end_of_file: 0,
@@ -711,51 +867,88 @@ pub fn is_file_resident_in_mft(file: &fs::File, len: u64) -> bool {
         )
     };
 
-    if ret != 0 && std_info.allocation_size == 0 && std_info.end_of_file > 0 {
-        return true;
+    ret != 0 && std_info.allocation_size == 0 && std_info.end_of_file > 0
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FileAllocatedRangeBuffer {
+    file_offset: i64,
+    length: i64,
+}
+
+fn is_sparse_file(path: &Path) -> bool {
+    let wide = path_to_wide(path);
+    let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_SPARSE_FILE) != 0
+}
+
+/// Fragt alle physisch allokierten Bereiche einer (Sparse-)Datei innerhalb von `[0, total_len)` ab.
+pub fn query_allocated_ranges(file: &fs::File, total_len: u64) -> io::Result<Vec<(u64, u64)>> {
+    if total_len == 0 {
+        return Ok(Vec::new());
     }
 
-    // Zusätzliche Verifikation via Retrieval Pointers
-    #[repr(C)]
-    struct StartingVcnInputBuffer {
-        starting_vcn: i64,
-    }
-    #[repr(C)]
-    struct RetrievalPointersBuffer {
-        extent_count: u32,
-        starting_vcn: i64,
-        extents: [u64; 2],
-    }
+    let handle = file.as_raw_handle();
+    let total_i64 = i64::try_from(total_len).unwrap_or(i64::MAX);
+    let mut ranges = Vec::new();
+    let mut cursor: i64 = 0;
 
-    let in_buf = StartingVcnInputBuffer { starting_vcn: 0 };
-    let mut out_buf: RetrievalPointersBuffer = unsafe { std::mem::zeroed() };
-    let mut bytes_ret = 0u32;
+    while cursor < total_i64 {
+        let query = FileAllocatedRangeBuffer {
+            file_offset: cursor,
+            length: total_i64 - cursor,
+        };
+        let mut out_buf = [FileAllocatedRangeBuffer {
+            file_offset: 0,
+            length: 0,
+        }; 64];
+        let mut bytes_ret: u32 = 0;
 
-    const ERROR_HANDLE_EOF: u32 = 38;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                FSCTL_QUERY_ALLOCATED_RANGES,
+                &query as *const _ as *const c_void,
+                std::mem::size_of::<FileAllocatedRangeBuffer>() as u32,
+                out_buf.as_mut_ptr() as *mut c_void,
+                std::mem::size_of_val(&out_buf) as u32,
+                &mut bytes_ret,
+                std::ptr::null_mut(),
+            )
+        };
 
-    let c_ret = unsafe {
-        DeviceIoControl(
-            handle,
-            FSCTL_GET_RETRIEVAL_POINTERS,
-            &in_buf as *const _ as *const c_void,
-            std::mem::size_of::<StartingVcnInputBuffer>() as u32,
-            &mut out_buf as *mut _ as *mut c_void,
-            std::mem::size_of::<RetrievalPointersBuffer>() as u32,
-            &mut bytes_ret,
-            std::ptr::null_mut(),
-        )
-    };
-
-    if c_ret == 0 {
-        let err = unsafe { GetLastError() };
-        if err == ERROR_HANDLE_EOF {
-            return true;
+        let err = if ok == 0 { unsafe { GetLastError() } } else { 0 };
+        if ok == 0 && err != ERROR_MORE_DATA {
+            return Err(io::Error::from_raw_os_error(err as i32));
         }
-    } else if out_buf.extent_count == 0 {
-        return true;
+
+        let elem_size = std::mem::size_of::<FileAllocatedRangeBuffer>();
+        let count = (bytes_ret as usize) / elem_size;
+        if count == 0 {
+            break;
+        }
+
+        for item in &out_buf[..count] {
+            if item.file_offset >= 0 && item.length > 0 {
+                let start = item.file_offset as u64;
+                let end = start.saturating_add(item.length as u64).min(total_len);
+                if end > start {
+                    ranges.push((start, end - start));
+                }
+            }
+            let next_pos = item.file_offset.saturating_add(item.length);
+            if next_pos > cursor {
+                cursor = next_pos;
+            }
+        }
+
+        if ok != 0 {
+            break;
+        }
     }
 
-    len <= 512
+    Ok(ranges)
 }
 
 pub fn trim_file(file: &fs::File, len: u64) -> bool {
@@ -879,59 +1072,94 @@ pub fn wipe_open_file_with_reporter<R: ShredReporter>(
     if wipe_len == 0 {
         return Ok(());
     }
+    wipe_open_ranges_with_reporter(
+        file,
+        &[(0, wipe_len)],
+        wipe_len,
+        num_passes,
+        is_ssd,
+        is_resident,
+        reporter,
+    )
+}
 
-    const CHUNK_SIZE: usize = 64 * 1024;
-    let zero_chunk = vec![0u8; CHUNK_SIZE];
-    let one_chunk = vec![0xFFu8; CHUNK_SIZE];
-    let mut rand_chunk = vec![0u8; CHUNK_SIZE];
+/// Überschreibt gezielt alle angegebenen `(offset, len)`-Bereiche einer offenen Datei,
+/// sendet bei SSDs ein TRIM-Deallocate, neutralisiert Zeitstempel und kürzt auf 0 Bytes.
+pub fn wipe_open_ranges_with_reporter<R: ShredReporter>(
+    file: &mut fs::File,
+    ranges: &[(u64, u64)],
+    trim_len: u64,
+    num_passes: usize,
+    is_ssd: bool,
+    is_resident: bool,
+    reporter: &mut R,
+) -> io::Result<()> {
+    let total_range_bytes: u64 = ranges.iter().map(|&(_, l)| l).sum();
+    if total_range_bytes == 0 && trim_len == 0 {
+        return Ok(());
+    }
 
-    // Auf SSD/NVMe oder bei residenten MFT-Dateien ist 1 Pass optimal:
-    // Schützt Flash-Endurance (P/E-Cycles) und überschreibt MFT-Payload direkt in-place
-    let effective_passes = if is_ssd || is_resident {
-        1
-    } else {
-        num_passes.max(1)
-    };
+    if total_range_bytes > 0 {
+        const CHUNK_SIZE: usize = 64 * 1024;
+        let zero_chunk = vec![0u8; CHUNK_SIZE];
+        let one_chunk = vec![0xFFu8; CHUNK_SIZE];
+        let mut rand_chunk = vec![0u8; CHUNK_SIZE];
 
-    for pass in 0..effective_passes {
-        if reporter.is_cancelled() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "Vorgang durch Benutzer abgebrochen"));
-        }
-
-        file.seek(SeekFrom::Start(0))?;
-        let mut remaining = wipe_len;
-
-        // Wenn 1 Pass: Krypto-Zufall (NIST SP 800-88 konform)
-        // Wenn 3 Passes: DoD 5220.22-M (0x00, 0xFF, Krypto-Zufall)
-        let pattern_type = if effective_passes == 1 {
-            2
+        // Auf SSD/NVMe oder bei residenten MFT-Dateien ist 1 Pass optimal:
+        // Schützt Flash-Endurance (P/E-Cycles) und überschreibt MFT-Payload direkt in-place
+        let effective_passes = if is_ssd || is_resident {
+            1
         } else {
-            pass % 3
+            num_passes.max(1)
         };
 
-        while remaining > 0 {
+        for pass in 0..effective_passes {
             if reporter.is_cancelled() {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "Vorgang durch Benutzer abgebrochen"));
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Vorgang durch Benutzer abgebrochen",
+                ));
             }
 
-            let write_size = std::cmp::min(remaining, CHUNK_SIZE as u64) as usize;
-            match pattern_type {
-                0 => file.write_all(&zero_chunk[..write_size])?,
-                1 => file.write_all(&one_chunk[..write_size])?,
-                _ => {
-                    fill_random_bytes(&mut rand_chunk[..write_size])?;
-                    file.write_all(&rand_chunk[..write_size])?;
+            // Wenn 1 Pass: Krypto-Zufall (NIST SP 800-88 konform)
+            // Wenn 3 Passes: DoD 5220.22-M (0x00, 0xFF, Krypto-Zufall)
+            let pattern_type = if effective_passes == 1 { 2 } else { pass % 3 };
+
+            for &(offset, range_len) in ranges {
+                if range_len == 0 {
+                    continue;
+                }
+                file.seek(SeekFrom::Start(offset))?;
+                let mut remaining = range_len;
+
+                while remaining > 0 {
+                    if reporter.is_cancelled() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "Vorgang durch Benutzer abgebrochen",
+                        ));
+                    }
+
+                    let write_size = std::cmp::min(remaining, CHUNK_SIZE as u64) as usize;
+                    match pattern_type {
+                        0 => file.write_all(&zero_chunk[..write_size])?,
+                        1 => file.write_all(&one_chunk[..write_size])?,
+                        _ => {
+                            fill_random_bytes(&mut rand_chunk[..write_size])?;
+                            file.write_all(&rand_chunk[..write_size])?;
+                        }
+                    }
+                    remaining -= write_size as u64;
+                    reporter.on_bytes_written(write_size as u64);
                 }
             }
-            remaining -= write_size as u64;
-            reporter.on_bytes_written(write_size as u64);
+            file.sync_all()?;
         }
-        file.sync_all()?;
     }
 
     // Hardware TRIM Deallocate senden (nur bei nicht-residenten Cluster-Dateien auf Flash)
-    if is_ssd && !is_resident {
-        let _ = trim_file(file, wipe_len);
+    if is_ssd && !is_resident && trim_len > 0 {
+        let _ = trim_file(file, trim_len);
     }
 
     // Zeitstempel auf 1601-01-01 neutralisieren (Timestomp)
@@ -992,10 +1220,8 @@ fn get_file_streams(path: &Path) -> Vec<String> {
     streams
 }
 
-fn shred_alternate_streams(path: &Path, num_passes: usize) -> io::Result<()> {
+fn shred_alternate_streams(path: &Path, num_passes: usize, is_ssd: bool) -> io::Result<()> {
     let streams = get_file_streams(path);
-    let media_type = get_drive_media_type(path);
-    let is_ssd = matches!(media_type, DriveMediaType::SsdNvme { .. });
 
     for stream_name in streams {
         let mut stream_path = path.as_os_str().to_os_string();
@@ -1018,55 +1244,124 @@ fn shred_alternate_streams(path: &Path, num_passes: usize) -> io::Result<()> {
     Ok(())
 }
 
-pub fn secure_single_rename(path: &Path) -> io::Result<PathBuf> {
-    let parent = match path.parent() {
-        Some(p) => p,
-        None => return Ok(path.to_path_buf()),
-    };
+/// Benennt `from` nach `to` um, ohne eine bereits existierende Zieldatei zu überschreiben (`dwFlags = 0`).
+fn move_file_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(to).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "Zieldatei existiert bereits",
+        ));
+    }
 
-    let mut current_path = path.to_path_buf();
+    let wide_from = path_to_wide(from);
+    let wide_to = path_to_wide(to);
+    const MAX_RETRIES: usize = 3;
 
-    if let Ok(meta) = fs::metadata(&current_path) {
-        let mut perms = meta.permissions();
-        if perms.readonly() {
-            perms.set_readonly(false);
-            let _ = fs::set_permissions(&current_path, perms);
+    for attempt in 0..MAX_RETRIES {
+        let ok = unsafe { MoveFileExW(wide_from.as_ptr(), wide_to.as_ptr(), 0) };
+        if ok != 0 {
+            return Ok(());
         }
+        let err = unsafe { GetLastError() };
+        if err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Zieldatei existiert bereits",
+            ));
+        }
+        // Kurzzeitige Sperren durch Explorer/Indexer kurz abwarten
+        if (err == 5 || err == 32) && attempt + 1 < MAX_RETRIES {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            continue;
+        }
+        return Err(io::Error::from_raw_os_error(err as i32));
     }
 
-    let mut rand_bytes = [0u8; 8];
-    let _ = fill_random_bytes(&mut rand_bytes);
-
-    let dummy_name = format!(
-        "shred_{:02x}{:02x}{:02x}{:02x}.tmp",
-        rand_bytes[0], rand_bytes[1], rand_bytes[2], rand_bytes[3]
-    );
-    let p = parent.join(dummy_name);
-    if fs::rename(&current_path, &p).is_ok() {
-        current_path = p;
-    }
-
-    Ok(current_path)
+    Err(io::Error::last_os_error())
 }
 
-pub fn purge_volume_usn_journal(volume_root: &Path) -> io::Result<()> {
-    let drive_letter = match volume_root.components().next() {
-        Some(std::path::Component::Prefix(prefix)) => {
-            let s = prefix.as_os_str().to_string_lossy();
-            let trimmed = s.trim_start_matches(r"\\?\").trim_end_matches('\\');
-            if trimmed.len() >= 2 && trimmed.ends_with(':') {
-                trimmed.to_string()
-            } else {
-                return Ok(());
-            }
+fn generate_random_hex_name(hex_chars: usize, prefix: &str, suffix: &str) -> io::Result<String> {
+    let byte_len = hex_chars.div_ceil(2).max(4);
+    let mut rand_bytes = vec![0u8; byte_len];
+    fill_random_bytes(&mut rand_bytes)?;
+    let mut name = String::with_capacity(prefix.len() + hex_chars + suffix.len());
+    name.push_str(prefix);
+    for b in &rand_bytes {
+        name.push_str(&format!("{:02x}", b));
+    }
+    name.truncate(prefix.len() + hex_chars);
+    name.push_str(suffix);
+    Ok(name)
+}
+
+fn rename_step_unique(
+    current: &Path,
+    parent: &Path,
+    hex_chars: usize,
+    prefix: &str,
+    suffix: &str,
+) -> io::Result<PathBuf> {
+    for _ in 0..16 {
+        let candidate_name = generate_random_hex_name(hex_chars, prefix, suffix)?;
+        let candidate_path = parent.join(candidate_name);
+        match move_file_no_replace(current, &candidate_path) {
+            Ok(()) => return Ok(candidate_path),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
         }
-        _ => return Ok(()),
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "Kein kollisionsfreier Zufallsname gefunden",
+    ))
+}
+
+/// Anonymisiert den Datei- oder Ordnernamen mehrfach kollisionssicher in der MFT / im Verzeichnisindex.
+pub fn secure_single_rename(path: &Path) -> io::Result<PathBuf> {
+    let abs_path = resolve_absolute_no_symlink(path);
+    let clean_path = strip_trailing_separators(&abs_path);
+    let parent = match clean_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => return Ok(clean_path),
+    };
+
+    let mut current_path = clean_path.clone();
+    let mut ro_guard = ReadonlyGuard::acquire(&current_path);
+
+    // Runde 1: Langer Zufallsname (überschreibt lange Originalnamen im Directory-Index, falls Pfadlänge reicht)
+    let orig_len = current_path
+        .file_name()
+        .map(|n| n.to_string_lossy().len())
+        .unwrap_or(16);
+    let long_len = orig_len.clamp(24, 64);
+    if let Ok(next) = rename_step_unique(&current_path, parent, long_len, "s_", ".tmp") {
+        current_path = next;
+        ro_guard.disarm();
+    }
+
+    // Runde 2: Mittlerer Zufallsname
+    if let Ok(next) = rename_step_unique(&current_path, parent, 20, "w_", ".dat") {
+        current_path = next;
+        ro_guard.disarm();
+    }
+
+    // Runde 3 (Final): Kurzer Zufallsname mit `shred_`-Präfix; Fehler werden hier explizit gemeldet
+    let final_path = rename_step_unique(&current_path, parent, 16, "shred_", ".tmp")?;
+    ro_guard.disarm();
+    Ok(final_path)
+}
+
+/// Löscht das NTFS USN-Journal auf dem Volume von `volume_root` und legt es mit derselben Konfiguration neu an.
+/// Gibt `Ok(true)` zurück, wenn ein Journal bereinigt wurde, oder `Ok(false)`, wenn kein aktives Journal vorliegt.
+pub fn purge_volume_usn_journal(volume_root: &Path) -> io::Result<bool> {
+    let Some(drive_letter) = extract_drive_letter(volume_root) else {
+        return Ok(false);
     };
 
     let volume_path = format!(r"\\.\{}", drive_letter);
     let wide_vol = to_wide_chars(&volume_path);
 
-    let handle = unsafe {
+    let handle = OwnedHandle::from_raw(unsafe {
         CreateFileW(
             wide_vol.as_ptr(),
             GENERIC_READ | GENERIC_WRITE,
@@ -1076,22 +1371,23 @@ pub fn purge_volume_usn_journal(volume_root: &Path) -> io::Result<()> {
             0,
             std::ptr::null_mut(),
         )
-    };
-
-    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
-        return Err(io::Error::last_os_error());
-    }
+    })
+    .ok_or_else(io::Error::last_os_error)?;
 
     // 1. Aktuelle Journal-Konfiguration abfragen
     let mut journal_data = USN_JOURNAL_DATA_V0 {
         usn_journal_id: 0,
-        allocation_delta: 0,
+        first_usn: 0,
+        next_usn: 0,
+        lowest_valid_usn: 0,
+        max_usn: 0,
         maximum_size: 0,
+        allocation_delta: 0,
     };
     let mut bytes_ret = 0u32;
     let q_ret = unsafe {
         DeviceIoControl(
-            handle,
+            handle.as_raw(),
             FSCTL_QUERY_USN_JOURNAL,
             std::ptr::null(),
             0,
@@ -1102,106 +1398,402 @@ pub fn purge_volume_usn_journal(volume_root: &Path) -> io::Result<()> {
         )
     };
 
-    if q_ret != 0 && journal_data.usn_journal_id != 0 {
-        let del_data = DELETE_USN_JOURNAL_DATA {
-            usn_journal_id: journal_data.usn_journal_id,
-            delete_flags: USN_DELETE_FLAG_DELETE,
-        };
-        let d_ret = unsafe {
-            DeviceIoControl(
-                handle,
-                FSCTL_DELETE_USN_JOURNAL,
-                &del_data as *const _ as *const c_void,
-                std::mem::size_of::<DELETE_USN_JOURNAL_DATA>() as u32,
-                std::ptr::null_mut(),
-                0,
-                &mut bytes_ret,
-                std::ptr::null_mut(),
-            )
-        };
+    if q_ret == 0 {
+        let err = unsafe { GetLastError() };
+        if err == ERROR_JOURNAL_NOT_ACTIVE || err == ERROR_INVALID_FUNCTION {
+            return Ok(false);
+        }
+        return Err(io::Error::from_raw_os_error(err as i32));
+    }
 
-        if d_ret != 0 {
-            let mut create_data = CREATE_USN_JOURNAL_DATA {
-                maximum_size: journal_data.maximum_size,
-                allocation_delta: journal_data.allocation_delta,
-            };
+    if journal_data.usn_journal_id == 0 {
+        return Ok(false);
+    }
+
+    // 2. Bestehendes Journal löschen
+    let del_data = DELETE_USN_JOURNAL_DATA {
+        usn_journal_id: journal_data.usn_journal_id,
+        delete_flags: USN_DELETE_FLAG_DELETE,
+    };
+    let d_ret = unsafe {
+        DeviceIoControl(
+            handle.as_raw(),
+            FSCTL_DELETE_USN_JOURNAL,
+            &del_data as *const _ as *const c_void,
+            std::mem::size_of::<DELETE_USN_JOURNAL_DATA>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_ret,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if d_ret == 0 {
+        let err = unsafe { GetLastError() };
+        if err == ERROR_JOURNAL_NOT_ACTIVE {
+            return Ok(false);
+        }
+        return Err(io::Error::from_raw_os_error(err as i32));
+    }
+
+    // 3. Journal leer mit ursprünglichen Parametern neu anlegen
+    let mut create_data = CREATE_USN_JOURNAL_DATA {
+        maximum_size: journal_data.maximum_size,
+        allocation_delta: journal_data.allocation_delta,
+    };
+    let c_ret = unsafe {
+        DeviceIoControl(
+            handle.as_raw(),
+            FSCTL_CREATE_USN_JOURNAL,
+            &mut create_data as *mut _ as *mut c_void,
+            std::mem::size_of::<CREATE_USN_JOURNAL_DATA>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_ret,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if c_ret == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(true)
+}
+
+/// Entfernt temporär ausschließlich das Read-Only-Bit und stellt es bei Drop wieder her,
+/// sofern der Vorgang zuvor fehlgeschlagen oder abgebrochen wurde.
+struct ReadonlyGuard {
+    path: PathBuf,
+    original_attrs: Option<u32>,
+    active: bool,
+}
+
+impl ReadonlyGuard {
+    fn acquire(path: &Path) -> Self {
+        let wide = path_to_wide(path);
+        let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
+        if attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY) != 0 {
+            let new_attrs = attrs & !FILE_ATTRIBUTE_READONLY;
+            let ok = unsafe { SetFileAttributesW(wide.as_ptr(), new_attrs) };
+            if ok != 0 {
+                return Self {
+                    path: path.to_path_buf(),
+                    original_attrs: Some(attrs),
+                    active: true,
+                };
+            }
+        }
+        Self {
+            path: path.to_path_buf(),
+            original_attrs: None,
+            active: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for ReadonlyGuard {
+    fn drop(&mut self) {
+        if self.active
+            && let Some(orig) = self.original_attrs
+        {
+            let wide = path_to_wide(&self.path);
             unsafe {
-                DeviceIoControl(
-                    handle,
-                    FSCTL_CREATE_USN_JOURNAL,
-                    &mut create_data as *mut _ as *mut c_void,
-                    std::mem::size_of::<CREATE_USN_JOURNAL_DATA>() as u32,
-                    std::ptr::null_mut(),
-                    0,
-                    &mut bytes_ret,
-                    std::ptr::null_mut(),
-                );
+                SetFileAttributesW(wide.as_ptr(), orig);
+            }
+        }
+    }
+}
+
+fn strip_trailing_separators(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    // Laufwerks-Roots wie "C:\" behalten ihren Backslash
+    if s.len() <= 3 && s.as_bytes().get(1) == Some(&b':') {
+        return path.to_path_buf();
+    }
+    let trimmed = s.trim_end_matches(['\\', '/']);
+    if trimmed.len() == 2 && trimmed.ends_with(':') {
+        PathBuf::from(format!("{}\\", trimmed))
+    } else if trimmed.is_empty() {
+        path.to_path_buf()
+    } else {
+        PathBuf::from(trimmed)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathSafetyLevel {
+    Safe,
+    Important(String),
+    Blocked(String),
+}
+
+fn normalize_win_path_for_compare(path: &Path, follow_symlinks: bool) -> String {
+    let resolved = if follow_symlinks {
+        path.canonicalize()
+            .unwrap_or_else(|_| resolve_absolute_no_symlink(path))
+    } else {
+        resolve_absolute_no_symlink(path)
+    };
+
+    let s = resolved.to_string_lossy();
+    let without_verbatim = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", rest)
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.to_string()
+    };
+
+    without_verbatim.trim_end_matches(['\\', '/']).to_lowercase()
+}
+
+fn is_same_or_subpath(candidate: &str, base: &str) -> bool {
+    if base.is_empty() {
+        return false;
+    }
+    if candidate == base {
+        return true;
+    }
+    candidate.len() > base.len()
+        && candidate.starts_with(base)
+        && candidate.as_bytes()[base.len()] == b'\\'
+}
+
+fn is_strict_subpath(candidate: &str, base: &str) -> bool {
+    !base.is_empty()
+        && candidate.len() > base.len()
+        && candidate.starts_with(base)
+        && candidate.as_bytes()[base.len()] == b'\\'
+}
+
+fn is_unc_share_or_server_root(norm: &str) -> bool {
+    if let Some(rest) = norm.strip_prefix(r"\\") {
+        let parts: Vec<&str> = rest.split('\\').filter(|p| !p.is_empty()).collect();
+        return parts.len() <= 2;
+    }
+    false
+}
+
+fn env_norm(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|v| normalize_win_path_for_compare(Path::new(&v), false))
+        .filter(|v| !v.is_empty())
+}
+
+fn classify_normalized_path(norm: &str) -> PathSafetyLevel {
+    if norm.is_empty()
+        || (norm.len() == 2 && norm.ends_with(':'))
+        || is_unc_share_or_server_root(norm)
+    {
+        return PathSafetyLevel::Blocked("Laufwerks- oder Netzwerkfreigabe-Stammverzeichnis".to_string());
+    }
+
+    // Laufwerksunabhängige System-/Boot-Container direkt auf beliebigen Laufwerken (<Drive>:\<ordner>)
+    if norm.len() > 3 && norm.as_bytes().get(1) == Some(&b':') && norm.as_bytes().get(2) == Some(&b'\\') {
+        let after_drive = &norm[3..];
+        let first_segment = after_drive.split('\\').next().unwrap_or("");
+        let drive_prefix = &norm[..2];
+
+        for critical_sub in ["boot", "efi", "recovery", "system volume information"] {
+            let full = format!("{}\\{}", drive_prefix, critical_sub);
+            if is_same_or_subpath(norm, &full) {
+                return PathSafetyLevel::Blocked(format!(
+                    "System-/Boot-Verzeichnis ({})",
+                    full.to_uppercase()
+                ));
+            }
+        }
+        if after_drive.eq_ignore_ascii_case("$recycle.bin") {
+            return PathSafetyLevel::Blocked("Windows-Papierkorb-Stammverzeichnis ($Recycle.Bin)".to_string());
+        }
+
+        // Kritische Root-Systemdateien oder bekannte Root-Ordner direkt auf System/Datenlaufwerk
+        for important_root_dir in ["windows.old", "perflogs", "inetpub"] {
+            let full = format!("{}\\{}", drive_prefix, important_root_dir);
+            if is_same_or_subpath(norm, &full) {
+                return PathSafetyLevel::Important(format!(
+                    "Relevanter System-/Installationsordner ({})",
+                    important_root_dir
+                ));
+            }
+        }
+        if first_segment == after_drive
+            && matches!(
+                first_segment,
+                "pagefile.sys" | "hiberfil.sys" | "swapfile.sys" | "bootmgr" | "bootnxt"
+            )
+        {
+            return PathSafetyLevel::Important(format!("Systemdatei im Stammverzeichnis ({})", first_segment));
+        }
+    }
+
+    // Windows-Systemverzeichnis & Kern-Unterordner
+    if let Some(sys_root) = env_norm("SystemRoot") {
+        if norm == sys_root {
+            return PathSafetyLevel::Blocked("Windows-Systemverzeichnis (%SystemRoot%)".to_string());
+        }
+        for core_sub in [
+            "system32",
+            "syswow64",
+            "winsxs",
+            "boot",
+            "systemapps",
+            "systemresources",
+            "servicing",
+            "fonts",
+            "inf",
+        ] {
+            let core_path = format!("{}\\{}", sys_root, core_sub);
+            if is_same_or_subpath(norm, &core_path) {
+                return PathSafetyLevel::Blocked(format!(
+                    "Geschützter Windows-Kernordner ({})",
+                    core_path
+                ));
+            }
+        }
+        if is_strict_subpath(norm, &sys_root) {
+            return PathSafetyLevel::Important(
+                "Unterordner bzw. Datei im Windows-Verzeichnis (%SystemRoot%\\*)".to_string(),
+            );
+        }
+    }
+
+    // Programme & systemweite Programmdaten
+    for (var_name, label) in [
+        ("ProgramFiles", "Programme (%ProgramFiles%)"),
+        ("ProgramFiles(x86)", "Programme x86 (%ProgramFiles(x86)%)"),
+        ("ProgramData", "Systemweite Programmdaten (%ProgramData%)"),
+    ] {
+        if let Some(base) = env_norm(var_name) {
+            if norm == base {
+                return PathSafetyLevel::Blocked(label.to_string());
+            }
+            if is_strict_subpath(norm, &base) {
+                return PathSafetyLevel::Important(format!("Installations-/App-Datenordner unter {}", label));
             }
         }
     }
 
-    unsafe { CloseHandle(handle); }
-    Ok(())
+    // Benutzer-Basisordner & Profile
+    if let Some(sys_drive) = env_norm("SystemDrive") {
+        let users_dir = format!("{}\\users", sys_drive);
+        if norm == users_dir {
+            return PathSafetyLevel::Blocked("Benutzer-Stammverzeichnis (\\Users)".to_string());
+        }
+        if is_same_or_subpath(norm, &format!("{}\\default", users_dir)) {
+            return PathSafetyLevel::Blocked("Standard-Benutzervorlage (\\Users\\Default)".to_string());
+        }
+        if norm == format!("{}\\public", users_dir) {
+            return PathSafetyLevel::Blocked("Öffentliches Benutzerverzeichnis (\\Users\\Public)".to_string());
+        }
+        // Direktes Profilverzeichnis C:\Users\<Name>
+        if let Some(rest) = norm.strip_prefix(&format!("{}\\", users_dir))
+            && !rest.contains('\\')
+        {
+            return PathSafetyLevel::Important(format!("Benutzerprofil-Stammverzeichnis ({})", norm));
+        }
+    }
+
+    // Aktives Benutzerprofil, AppData und wichtige Haupt-Benutzerordner selbst
+    if let Some(user_prof) = env_norm("USERPROFILE") {
+        if norm == user_prof {
+            return PathSafetyLevel::Important("Aktives Benutzerprofil (%USERPROFILE%)".to_string());
+        }
+        if norm == format!("{}\\appdata", user_prof) {
+            return PathSafetyLevel::Important("Anwendungsdaten-Stammordner (AppData)".to_string());
+        }
+        for folder in [
+            "desktop",
+            "documents",
+            "dokumente",
+            "downloads",
+            "pictures",
+            "bilder",
+            "music",
+            "musik",
+            "videos",
+            "onedrive",
+        ] {
+            if norm == format!("{}\\{}", user_prof, folder) {
+                return PathSafetyLevel::Important(format!(
+                    "Wichtiger persönlicher Hauptordner ({})",
+                    folder
+                ));
+            }
+        }
+    }
+
+    for (var_name, label) in [
+        ("APPDATA", "Roaming-Anwendungsdaten (%APPDATA%)"),
+        ("LOCALAPPDATA", "Lokale Anwendungsdaten (%LOCALAPPDATA%)"),
+    ] {
+        if let Some(base) = env_norm(var_name)
+            && norm == base
+        {
+            return PathSafetyLevel::Important(label.to_string());
+        }
+    }
+
+    PathSafetyLevel::Safe
 }
 
-fn clear_readonly(path: &Path) {
-    let wide = path_to_wide(path);
-    unsafe {
-        SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_NORMAL);
+/// Klassifiziert einen Pfad in `Safe`, `Important` (erzwingt Warnung) oder `Blocked` (strikte Blockade).
+/// Löst Symlinks/Junctions nicht blind als Blockade auf, sodass Links auf Systemordner als `Important` gelöscht werden dürfen.
+pub fn classify_path_safety(path: &Path) -> PathSafetyLevel {
+    if path.as_os_str().is_empty() {
+        return PathSafetyLevel::Blocked("Leerer Pfad".to_string());
     }
+
+    // 1. Prüfung des Pfads selbst ohne Symlink-Auflösung
+    let own_norm = normalize_win_path_for_compare(path, false);
+    let own_level = classify_normalized_path(&own_norm);
+    if matches!(own_level, PathSafetyLevel::Blocked(_)) {
+        return own_level;
+    }
+
+    // 2. Reparse-Point / Symlink prüfen: Ziel nicht stillschweigend blockieren, sondern nur warnen
+    let is_symlink = fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+
+    if is_symlink {
+        if let Ok(canon) = path.canonicalize() {
+            let target_norm = normalize_win_path_for_compare(&canon, false);
+            match classify_normalized_path(&target_norm) {
+                PathSafetyLevel::Blocked(r) | PathSafetyLevel::Important(r) => {
+                    return PathSafetyLevel::Important(format!(
+                        "Verknüpfung/Junction verweist auf geschütztes Ziel ({}) – nur die Verknüpfung wird gelöscht",
+                        r
+                    ));
+                }
+                PathSafetyLevel::Safe => {}
+            }
+        }
+        return own_level;
+    }
+
+    // 3. Für normale Dateien/Ordner zusätzlich aufgelösten Pfad prüfen (z. B. subst-Laufwerke / Mount-Points)
+    if let Ok(canon) = path.canonicalize() {
+        let canon_norm = normalize_win_path_for_compare(&canon, false);
+        let canon_level = classify_normalized_path(&canon_norm);
+        match (&own_level, &canon_level) {
+            (_, PathSafetyLevel::Blocked(_)) => return canon_level,
+            (PathSafetyLevel::Safe, PathSafetyLevel::Important(_)) => return canon_level,
+            _ => {}
+        }
+    }
+
+    own_level
 }
 
 fn is_dangerous_or_root_path(path: &Path) -> bool {
-    if path.as_os_str().is_empty() {
-        return true;
-    }
-
-    let full = match path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => {
-            if path.is_relative() {
-                env::current_dir().map(|cd| cd.join(path)).unwrap_or_else(|_| path.to_path_buf())
-            } else {
-                path.to_path_buf()
-            }
-        }
-    };
-
-    let s = full.to_string_lossy();
-    let trimmed = s.trim_start_matches(r"\\?\").trim_end_matches('\\');
-
-    // Blockiere leere Pfade, Laufwerksbuchstaben (z.B. "C:", "D:") und Root
-    if trimmed.is_empty() || (trimmed.len() == 2 && trimmed.ends_with(':')) {
-        return true;
-    }
-
-    // Blockiere Windows-Systemverzeichnisse
-    if let Ok(sys_root) = env::var("SystemRoot") {
-        let clean_sys = sys_root.trim_end_matches('\\');
-        if trimmed.eq_ignore_ascii_case(clean_sys)
-            || trimmed.to_lowercase().starts_with(&format!("{}\\system32", clean_sys.to_lowercase()))
-        {
-            return true;
-        }
-    }
-    if let Ok(prog_files) = env::var("ProgramFiles") {
-        if trimmed.eq_ignore_ascii_case(prog_files.trim_end_matches('\\')) {
-            return true;
-        }
-    }
-    if let Ok(prog_files_x86) = env::var("ProgramFiles(x86)") {
-        if trimmed.eq_ignore_ascii_case(prog_files_x86.trim_end_matches('\\')) {
-            return true;
-        }
-    }
-    if let Ok(system_drive) = env::var("SystemDrive") {
-        let users_dir = format!("{}\\Users", system_drive.trim_end_matches('\\'));
-        if trimmed.eq_ignore_ascii_case(&users_dir) {
-            return true;
-        }
-    }
-
-    false
+    matches!(classify_path_safety(path), PathSafetyLevel::Blocked(_))
 }
 
 pub fn shred_file(path: &Path, num_passes: usize) -> io::Result<()> {
@@ -1214,70 +1806,104 @@ pub fn shred_file_with_reporter<R: ShredReporter>(
     reporter: &mut R,
 ) -> io::Result<()> {
     if reporter.is_cancelled() {
-        return Err(io::Error::new(io::ErrorKind::Interrupted, "Vorgang durch Benutzer abgebrochen"));
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Vorgang durch Benutzer abgebrochen",
+        ));
     }
     reporter.on_item_start(path, false);
 
-    clear_readonly(path);
-    let _ = shred_alternate_streams(path, num_passes);
+    // Zuerst Schreibzugriff auf die Hauptdatei absichern, bevor Attribute oder ADS verändert werden
+    let mut ro_guard = ReadonlyGuard::acquire(path);
+    let mut file = OpenOptions::new().write(true).read(true).open(path)?;
 
     let media_type = get_drive_media_type(path);
     let is_ssd = matches!(media_type, DriveMediaType::SsdNvme { .. });
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .read(true)
-        .open(path)?;
+    // Alternate Data Streams erst nach erfolgreichem Öffnen der Hauptdatei schreddern
+    let _ = shred_alternate_streams(path, num_passes, is_ssd);
 
     let len = file.metadata()?.len();
     if len > 0 {
         let is_resident = is_file_resident_in_mft(&file, len);
-        let wipe_len = if is_resident {
-            // KRITISCH: Residente Dateien NIEMALS vergroessern!
-            // Exakt die Nutzdatenlaenge in-place ueberschreiben, damit keine Cluster ausgelagert werden.
-            len
+        let sparse_ranges = if !is_resident && is_sparse_file(path) {
+            query_allocated_ranges(&file, len).ok()
         } else {
-            // Ermittle reale physische Cluster-Belegung (AllocationSize)
-            let mut std_info = FILE_STANDARD_INFO {
-                allocation_size: 0,
-                end_of_file: 0,
-                number_of_links: 0,
-                delete_pending: 0,
-                directory: 0,
-            };
-            let ret = unsafe {
-                GetFileInformationByHandleEx(
-                    file.as_raw_handle() as *mut c_void,
-                    FILE_STANDARD_INFO_CLASS,
-                    &mut std_info as *mut _ as *mut c_void,
-                    std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
-                )
-            };
-            if ret != 0 && std_info.allocation_size > 0 {
-                std_info.allocation_size as u64
-            } else {
-                let cluster_size = get_cluster_size(path);
-                let remainder = len % cluster_size;
-                if remainder != 0 {
-                    len + (cluster_size - remainder)
-                } else {
-                    len
-                }
-            }
+            None
         };
 
-        wipe_open_file_with_reporter(&mut file, wipe_len, num_passes, is_ssd, is_resident, reporter)?;
+        if let Some(ranges) = sparse_ranges {
+            wipe_open_ranges_with_reporter(
+                &mut file,
+                &ranges,
+                len,
+                num_passes,
+                is_ssd,
+                false,
+                reporter,
+            )?;
+        } else {
+            let wipe_len = if is_resident {
+                // KRITISCH: Residente Dateien NIEMALS vergroessern!
+                // Exakt die Nutzdatenlaenge in-place ueberschreiben, damit keine Cluster ausgelagert werden.
+                len
+            } else {
+                // Ermittle reale physische Cluster-Belegung (AllocationSize)
+                let mut std_info = FILE_STANDARD_INFO {
+                    allocation_size: 0,
+                    end_of_file: 0,
+                    number_of_links: 0,
+                    delete_pending: 0,
+                    directory: 0,
+                };
+                let ret = unsafe {
+                    GetFileInformationByHandleEx(
+                        file.as_raw_handle(),
+                        FILE_STANDARD_INFO_CLASS,
+                        &mut std_info as *mut _ as *mut c_void,
+                        std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+                    )
+                };
+                if ret != 0 && std_info.allocation_size > 0 {
+                    std_info.allocation_size as u64
+                } else {
+                    let cluster_size = get_cluster_size(path);
+                    let remainder = len % cluster_size;
+                    if remainder != 0 {
+                        len + (cluster_size - remainder)
+                    } else {
+                        len
+                    }
+                }
+            };
+
+            wipe_open_file_with_reporter(
+                &mut file,
+                wipe_len,
+                num_passes,
+                is_ssd,
+                is_resident,
+                reporter,
+            )?;
+        }
+    } else {
+        neutralize_timestamps(&file);
     }
 
     drop(file);
 
     if reporter.is_cancelled() {
-        return Err(io::Error::new(io::ErrorKind::Interrupted, "Vorgang durch Benutzer abgebrochen"));
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Vorgang durch Benutzer abgebrochen",
+        ));
     }
 
-    let final_path = secure_single_rename(path).unwrap_or_else(|_| path.to_path_buf());
-    clear_readonly(&final_path);
+    let final_path = secure_single_rename(path)?;
+    ro_guard.disarm();
+    let mut final_ro = ReadonlyGuard::acquire(&final_path);
     fs::remove_file(&final_path)?;
+    final_ro.disarm();
 
     // Explorer über die Löschung benachrichtigen
     let wide_deleted = path_to_wide(&final_path);
@@ -1308,62 +1934,78 @@ pub fn shred_recursive_with_reporter<R: ShredReporter>(
         return;
     }
 
-    if is_dangerous_or_root_path(path) {
+    let clean_path = strip_trailing_separators(path);
+
+    if is_dangerous_or_root_path(&clean_path) {
         *errors += 1;
-        eprintln!("Schutzfunktion aktiv: System- oder Stammverzeichnis wird nicht geschreddert: {:?}", path);
+        eprintln!(
+            "Schutzfunktion aktiv: System- oder Stammverzeichnis wird nicht geschreddert: {:?}",
+            clean_path
+        );
         return;
     }
 
-    clear_readonly(path);
-
-    let sym_meta = match fs::symlink_metadata(path) {
+    let sym_meta = match fs::symlink_metadata(&clean_path) {
         Ok(m) => m,
         Err(e) => {
             *errors += 1;
-            eprintln!("Fehler beim Lesen der Metadaten für {:?}: {}", path, e);
+            eprintln!("Fehler beim Lesen der Metadaten für {:?}: {}", clean_path, e);
             return;
         }
     };
 
     // KRITISCH: Symlinks und Junctions NIEMALS betreten oder das Ziel überschreiben!
     if sym_meta.file_type().is_symlink() {
-        reporter.on_item_start(path, false);
-        let final_path = secure_single_rename(path).unwrap_or_else(|_| path.to_path_buf());
-        clear_readonly(&final_path);
-        if fs::remove_file(&final_path).is_err() && fs::remove_dir(&final_path).is_err() {
-            *errors += 1;
-        } else {
-            let wide_deleted = path_to_wide(&final_path);
-            unsafe {
-                SHChangeNotify(
-                    SHCNE_ALLEVENTS,
-                    SHCNF_PATHW | SHCNF_FLUSH,
-                    wide_deleted.as_ptr() as *const c_void,
-                    std::ptr::null(),
-                );
+        reporter.on_item_start(&clean_path, false);
+        match secure_single_rename(&clean_path) {
+            Ok(final_path) => {
+                let mut ro_guard = ReadonlyGuard::acquire(&final_path);
+                if fs::remove_file(&final_path).is_err() && fs::remove_dir(&final_path).is_err() {
+                    *errors += 1;
+                } else {
+                    ro_guard.disarm();
+                    let wide_deleted = path_to_wide(&final_path);
+                    unsafe {
+                        SHChangeNotify(
+                            SHCNE_ALLEVENTS,
+                            SHCNF_PATHW | SHCNF_FLUSH,
+                            wide_deleted.as_ptr() as *const c_void,
+                            std::ptr::null(),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                *errors += 1;
+                eprintln!("Fehler beim Umbenennen der Verknüpfung {:?}: {}", clean_path, e);
             }
         }
-        reporter.on_item_done(path, false);
+        reporter.on_item_done(&clean_path, false);
         return;
     }
 
     if sym_meta.is_dir() {
-        reporter.on_item_start(path, true);
-        match fs::read_dir(path) {
+        reporter.on_item_start(&clean_path, true);
+        match fs::read_dir(&clean_path) {
             Ok(entries) => {
                 for entry in entries {
                     if reporter.is_cancelled() {
                         return;
                     }
                     match entry {
-                        Ok(e) => shred_recursive_with_reporter(&e.path(), num_passes, errors, reporter),
+                        Ok(e) => {
+                            shred_recursive_with_reporter(&e.path(), num_passes, errors, reporter)
+                        }
                         Err(_) => *errors += 1,
                     }
                 }
             }
             Err(e) => {
                 *errors += 1;
-                eprintln!("Fehler beim Lesen des Verzeichnisses {:?}: {}", path, e);
+                eprintln!(
+                    "Fehler beim Lesen des Verzeichnisses {:?}: {}",
+                    clean_path, e
+                );
             }
         }
 
@@ -1371,30 +2013,52 @@ pub fn shred_recursive_with_reporter<R: ShredReporter>(
             return;
         }
 
-        clear_readonly(path);
-        neutralize_dir_timestamps(path);
-        let final_dir_path = secure_single_rename(path).unwrap_or_else(|_| path.to_path_buf());
-        clear_readonly(&final_dir_path);
-        if let Err(e) = fs::remove_dir(&final_dir_path) {
-            *errors += 1;
-            eprintln!("Fehler beim Entfernen des Verzeichnisses {:?}: {}", final_dir_path, e);
-        } else {
-            let wide_deleted = path_to_wide(&final_dir_path);
-            unsafe {
-                SHChangeNotify(
-                    SHCNE_ALLEVENTS,
-                    SHCNF_PATHW | SHCNF_FLUSH,
-                    wide_deleted.as_ptr() as *const c_void,
-                    std::ptr::null(),
+        // Eventuelle Alternate Data Streams des Verzeichnisses schreddern
+        let is_ssd = matches!(
+            get_drive_media_type(&clean_path),
+            DriveMediaType::SsdNvme { .. }
+        );
+        let _ = shred_alternate_streams(&clean_path, num_passes, is_ssd);
+
+        let mut ro_guard = ReadonlyGuard::acquire(&clean_path);
+        neutralize_dir_timestamps(&clean_path);
+        match secure_single_rename(&clean_path) {
+            Ok(final_dir_path) => {
+                ro_guard.disarm();
+                let mut final_ro = ReadonlyGuard::acquire(&final_dir_path);
+                if let Err(e) = fs::remove_dir(&final_dir_path) {
+                    *errors += 1;
+                    eprintln!(
+                        "Fehler beim Entfernen des Verzeichnisses {:?}: {}",
+                        final_dir_path, e
+                    );
+                } else {
+                    final_ro.disarm();
+                    let wide_deleted = path_to_wide(&final_dir_path);
+                    unsafe {
+                        SHChangeNotify(
+                            SHCNE_ALLEVENTS,
+                            SHCNF_PATHW | SHCNF_FLUSH,
+                            wide_deleted.as_ptr() as *const c_void,
+                            std::ptr::null(),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                *errors += 1;
+                eprintln!(
+                    "Fehler beim Umbenennen des Verzeichnisses {:?}: {}",
+                    clean_path, e
                 );
             }
         }
-        reporter.on_item_done(path, true);
-    } else {
-        if let Err(e) = shred_file_with_reporter(path, num_passes, reporter) {
-            *errors += 1;
-            eprintln!("Fehler beim Schreddern der Datei {:?}: {}", path, e);
-        }
+        reporter.on_item_done(&clean_path, true);
+    } else if let Err(e) = shred_file_with_reporter(&clean_path, num_passes, reporter)
+        && e.kind() != io::ErrorKind::Interrupted
+    {
+        *errors += 1;
+        eprintln!("Fehler beim Schreddern der Datei {:?}: {}", clean_path, e);
     }
 }
 
@@ -1624,6 +2288,7 @@ fn run_uninstall_backend() -> Result<(), String> {
     run_reg(&["delete", r"HKCU\Software\Classes\Directory\shell\WinShred", "/f"]);
     run_reg(&["delete", r"HKCR\*\shell\WinShred", "/f"]);
     run_reg(&["delete", r"HKCR\Directory\shell\WinShred", "/f"]);
+    run_reg(&["delete", r"HKCU\Software\WinShred", "/f"]);
 
     // 3. SendTo-Verknüpfung löschen
     if let Ok(appdata) = env::var("APPDATA") {
@@ -1698,6 +2363,8 @@ const PBS_SMOOTH: u32 = 0x0001;
 const PBS_MARQUEE: u32 = 0x0008;
 const BM_SETCHECK: u32 = 0x00F1;
 const BM_GETCHECK: u32 = 0x00F0;
+const BM_SETSTYLE: u32 = 0x00F4;
+const DM_SETDEFID: u32 = 0x0401;
 const BST_CHECKED: usize = 1;
 const BS_AUTORADIOBUTTON: u32 = 0x00000009;
 const BS_AUTOCHECKBOX: u32 = 0x00000003;
@@ -1717,6 +2384,7 @@ const WS_GROUP: u32 = 0x00020000;
 const WS_DISABLED: u32 = 0x08000000;
 const WM_SETFONT: u32 = 0x0030;
 const WM_COMMAND: u32 = 0x0111;
+const WM_TIMER: u32 = 0x0113;
 const WM_PAINT: u32 = 0x000F;
 const WM_DESTROY: u32 = 0x0002;
 const WM_CLOSE: u32 = 0x0010;
@@ -2530,6 +3198,124 @@ fn show_installer_wizard() {
 }
 
 // ==========================================
+// Persistente Benutzereinstellungen (Registry)
+// ==========================================
+
+const REG_SETTINGS_SUBKEY: &str = r"Software\WinShred";
+const REG_VAL_SKIP_PROMPT: &str = "SkipSafetyPrompt";
+
+/// Liest die Einstellung „Sicherheitsprüfung in Zukunft überspringen“ aus `HKCU\Software\WinShred`.
+pub fn get_skip_safety_prompt() -> bool {
+    let subkey = to_wide_chars(REG_SETTINGS_SUBKEY);
+    let val_name = to_wide_chars(REG_VAL_SKIP_PROMPT);
+    let mut hkey: *mut c_void = std::ptr::null_mut();
+
+    let res = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut hkey) };
+    if res != 0 || hkey.is_null() {
+        return false;
+    }
+
+    let mut data: u32 = 0;
+    let mut data_size: u32 = std::mem::size_of::<u32>() as u32;
+    let mut val_type: u32 = 0;
+    let qres = unsafe {
+        RegQueryValueExW(
+            hkey,
+            val_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut val_type,
+            &mut data as *mut u32 as *mut u8,
+            &mut data_size,
+        )
+    };
+    unsafe {
+        RegCloseKey(hkey);
+    }
+
+    qres == 0 && val_type == REG_DWORD && data != 0
+}
+
+/// Speichert die Einstellung „Sicherheitsprüfung in Zukunft überspringen“ in `HKCU\Software\WinShred`.
+pub fn set_skip_safety_prompt(skip: bool) {
+    let subkey = to_wide_chars(REG_SETTINGS_SUBKEY);
+    let val_name = to_wide_chars(REG_VAL_SKIP_PROMPT);
+    let mut hkey: *mut c_void = std::ptr::null_mut();
+    let mut disp: u32 = 0;
+
+    let res = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            KEY_WRITE,
+            std::ptr::null_mut(),
+            &mut hkey,
+            &mut disp,
+        )
+    };
+    if res != 0 || hkey.is_null() {
+        return;
+    }
+
+    if skip {
+        let data: u32 = 1;
+        unsafe {
+            RegSetValueExW(
+                hkey,
+                val_name.as_ptr(),
+                0,
+                REG_DWORD,
+                &data as *const u32 as *const u8,
+                std::mem::size_of::<u32>() as u32,
+            );
+        }
+    } else {
+        unsafe {
+            RegDeleteValueW(hkey, val_name.as_ptr());
+        }
+    }
+
+    unsafe {
+        RegCloseKey(hkey);
+    }
+}
+
+/// Zitiert ein einzelnes Argument nach Windows-`CommandLineToArgvW`-Regeln (inkl. Trailing-Backslashes).
+pub fn quote_windows_cli_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|c| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '"')) {
+        return arg.to_string();
+    }
+
+    let mut out = String::with_capacity(arg.len() + 4);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+        } else if ch == '"' {
+            for _ in 0..(backslashes * 2 + 1) {
+                out.push('\\');
+            }
+            out.push('"');
+            backslashes = 0;
+        } else {
+            for _ in 0..backslashes {
+                out.push('\\');
+            }
+            backslashes = 0;
+            out.push(ch);
+        }
+    }
+    for _ in 0..(backslashes * 2) {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
+// ==========================================
 // Sicherheitsbestätigungs-Dialog mit Admin-Option
 // ==========================================
 
@@ -2540,9 +3326,14 @@ pub enum ConfirmationResult {
     ShredAsAdmin,
 }
 
+const ID_CHK_SKIP_PROMPT: usize = 104;
+
 static mut CONFIRMATION_CHOICE: ConfirmationResult = ConfirmationResult::Cancel;
 static mut CONFIRM_HDR_TITLE: *mut c_void = std::ptr::null_mut();
 static mut CONFIRM_HDR_SUB: *mut c_void = std::ptr::null_mut();
+static mut CONFIRM_LBL_IMPORTANT: *mut c_void = std::ptr::null_mut();
+static mut CONFIRM_CHK_SKIP: *mut c_void = std::ptr::null_mut();
+static mut CONFIRM_SKIP_CHECKED: bool = false;
 
 unsafe extern "system" fn confirm_dialog_wnd_proc(
     hwnd: *mut c_void,
@@ -2554,13 +3345,18 @@ unsafe extern "system" fn confirm_dialog_wnd_proc(
         match msg {
             WM_COMMAND => {
                 let id = wparam & 0xFFFF;
-                if id == 101 {
-                    CONFIRMATION_CHOICE = ConfirmationResult::ShredStandard;
+                if id == 101 || id == 102 {
+                    if !CONFIRM_CHK_SKIP.is_null() {
+                        CONFIRM_SKIP_CHECKED =
+                            SendMessageW(CONFIRM_CHK_SKIP, BM_GETCHECK, 0, 0) == BST_CHECKED as isize;
+                    }
+                    CONFIRMATION_CHOICE = if id == 101 {
+                        ConfirmationResult::ShredStandard
+                    } else {
+                        ConfirmationResult::ShredAsAdmin
+                    };
                     DestroyWindow(hwnd);
-                } else if id == 102 {
-                    CONFIRMATION_CHOICE = ConfirmationResult::ShredAsAdmin;
-                    DestroyWindow(hwnd);
-                } else if id == 103 {
+                } else if id == 103 || id == 2 /* IDCANCEL */ {
                     CONFIRMATION_CHOICE = ConfirmationResult::Cancel;
                     DestroyWindow(hwnd);
                 }
@@ -2575,6 +3371,11 @@ unsafe extern "system" fn confirm_dialog_wnd_proc(
                     SetBkColor(hdc, 0x00FFFFFF);
                     H_BRUSH_WHITE as isize
                 } else {
+                    if !CONFIRM_LBL_IMPORTANT.is_null() && h_ctrl == CONFIRM_LBL_IMPORTANT {
+                        SetTextColor(hdc, 0x001414B4); // Rot
+                    } else {
+                        SetTextColor(hdc, 0x00000000);
+                    }
                     SetBkColor(hdc, 0x00F0F0F0);
                     H_BRUSH_DIALOG as isize
                 }
@@ -2592,12 +3393,12 @@ unsafe extern "system" fn confirm_dialog_wnd_proc(
                 FillRect(hdc, &rc_line, H_BRUSH_LINE);
 
                 // 3. Unterer Bereich (Dialog-Grau)
-                let rc_bottom = RECT { left: 0, top: 86, right: 540, bottom: 360 };
+                let rc_bottom = RECT { left: 0, top: 86, right: 540, bottom: 420 };
                 FillRect(hdc, &rc_bottom, H_BRUSH_DIALOG);
 
-                // 4. Logo / Icon im Header
+                // 4. Logo / Icon im Header (LR_SHARED verhindert Handle-Leak)
                 let h_inst = GetModuleHandleW(std::ptr::null());
-                let h_icon = LoadImageW(h_inst, 1 as *const u16, 1, 32, 32, 0);
+                let h_icon = LoadImageW(h_inst, 1 as *const u16, 1, 32, 32, LR_SHARED);
                 if !h_icon.is_null() {
                     DrawIconEx(hdc, 20, 24, h_icon, 32, 32, 0, std::ptr::null_mut(), 0x0003);
                 }
@@ -2636,9 +3437,16 @@ fn init_gui_resources() {
     }
 }
 
-pub fn show_confirmation_dialog(paths: &[PathBuf], is_already_admin: bool) -> ConfirmationResult {
+pub fn show_confirmation_dialog(
+    paths: &[PathBuf],
+    is_already_admin: bool,
+    important_reasons: &[String],
+) -> (ConfirmationResult, bool) {
     unsafe {
         CONFIRMATION_CHOICE = ConfirmationResult::Cancel;
+        CONFIRM_LBL_IMPORTANT = std::ptr::null_mut();
+        CONFIRM_CHK_SKIP = std::ptr::null_mut();
+        CONFIRM_SKIP_CHECKED = get_skip_safety_prompt();
         init_gui_resources();
 
         let instance = GetModuleHandleW(std::ptr::null());
@@ -2650,14 +3458,17 @@ pub fn show_confirmation_dialog(paths: &[PathBuf], is_already_admin: bool) -> Co
         wnd_class.lpfn_wnd_proc = Some(confirm_dialog_wnd_proc);
         wnd_class.h_instance = instance;
         wnd_class.h_cursor = LoadCursorW(std::ptr::null_mut(), 32512 as *const u16);
-        wnd_class.h_icon = LoadImageW(instance, 1 as *const u16, 1, 32, 32, 0);
-        wnd_class.h_icon_sm = LoadImageW(instance, 1 as *const u16, 1, 16, 16, 0);
+        wnd_class.h_icon = LoadImageW(instance, 1 as *const u16, 1, 32, 32, LR_SHARED);
+        wnd_class.h_icon_sm = LoadImageW(instance, 1 as *const u16, 1, 16, 16, LR_SHARED);
         wnd_class.lpsz_class_name = class_name.as_ptr();
 
         RegisterClassExW(&wnd_class);
 
-        // Fenstergroesse (Client 540x360)
-        let mut rc = RECT { left: 0, top: 0, right: 540, bottom: 360 };
+        let has_important = !important_reasons.is_empty();
+        let client_h = if has_important { 420 } else { 386 };
+
+        // Fenstergroesse
+        let mut rc = RECT { left: 0, top: 0, right: 540, bottom: client_h };
         let win_style = 0x00000000 | 0x00C00000 | 0x00080000; // WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU
         AdjustWindowRectEx(&mut rc, win_style, 0, 0);
         let win_w = rc.right - rc.left;
@@ -2686,7 +3497,7 @@ pub fn show_confirmation_dialog(paths: &[PathBuf], is_already_admin: bool) -> Co
         );
 
         if hwnd.is_null() {
-            return ConfirmationResult::Cancel;
+            return (ConfirmationResult::Cancel, CONFIRM_SKIP_CHECKED);
         }
 
         SendMessageW(hwnd, 0x0080 /* WM_SETICON */, 1 /* ICON_BIG */, wnd_class.h_icon as isize);
@@ -2715,8 +3526,16 @@ pub fn show_confirmation_dialog(paths: &[PathBuf], is_already_admin: bool) -> Co
         let count = paths.len();
         let prompt_sub = if count == 1 {
             let name = paths[0].file_name().unwrap_or_default().to_string_lossy();
-            let is_dir = paths[0].is_dir();
-            let typ = if is_dir { "den Ordner" } else { "die Datei" };
+            let sym_meta = fs::symlink_metadata(&paths[0]);
+            let is_link = sym_meta.as_ref().map(|m| m.file_type().is_symlink()).unwrap_or(false);
+            let is_dir = sym_meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let typ = if is_link {
+                "die Verknüpfung"
+            } else if is_dir {
+                "den Ordner"
+            } else {
+                "die Datei"
+            };
             format!("Möchten Sie {} '{}' unwiderruflich vernichten?", typ, name)
         } else {
             format!("Möchten Sie diese {} Elemente unwiderruflich vernichten?", count)
@@ -2758,7 +3577,7 @@ pub fn show_confirmation_dialog(paths: &[PathBuf], is_already_admin: bool) -> Co
         // Infobox "Warum als Administrator?"
         create_ctrl(
             0, "BUTTON", "Option: Erweiterte Forensik & Journal-Bereinigung",
-            WS_CHILD | WS_VISIBLE | BS_GROUPBOX, 18, 194, 504, 94, hwnd, 0, H_FONT_BOLD,
+            WS_CHILD | WS_VISIBLE | BS_GROUPBOX, 18, 194, 504, 90, hwnd, 0, H_FONT_BOLD,
         );
         let info_desc = if is_already_admin {
             "Administrator-Modus aktiv: WinShred kann nach dem Schreddern das interne NTFS-Änderungsjournal ($UsnJrnl) zurücksetzen, um auch historische Dateinamen-Einträge auf den Laufwerken rückstandslos zu tilgen."
@@ -2767,41 +3586,77 @@ pub fn show_confirmation_dialog(paths: &[PathBuf], is_already_admin: bool) -> Co
         };
         create_ctrl(
             0, "STATIC", info_desc,
-            WS_CHILD | WS_VISIBLE, 28, 218, 484, 62, hwnd, 0, H_FONT_REGULAR,
+            WS_CHILD | WS_VISIBLE, 28, 216, 484, 60, hwnd, 0, H_FONT_REGULAR,
         );
+
+        let mut next_y = 292;
+        if has_important {
+            let reason_line = important_reasons
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or("Relevanter System-, Programm- oder Profilordner");
+            let warn_text = format!(
+                "ACHTUNG – Kritischer Ordner/Pfad: {}",
+                shorten_path_display(reason_line, 66)
+            );
+            CONFIRM_LBL_IMPORTANT = create_ctrl(
+                0, "STATIC", &warn_text,
+                WS_CHILD | WS_VISIBLE, 22, next_y, 496, 28, hwnd, 0, H_FONT_BOLD,
+            );
+            next_y += 34;
+        }
+
+        CONFIRM_CHK_SKIP = create_ctrl(
+            0,
+            "BUTTON",
+            "Sicherheitsprüfung in Zukunft überspringen (außer bei wichtigen System-/Profilordnern)",
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
+            20,
+            next_y,
+            500,
+            20,
+            hwnd,
+            ID_CHK_SKIP_PROMPT,
+            H_FONT_REGULAR,
+        );
+        if CONFIRM_SKIP_CHECKED {
+            SendMessageW(CONFIRM_CHK_SKIP, BM_SETCHECK, BST_CHECKED, 0);
+        }
+
+        let btn_y = client_h - 46;
 
         // Buttons
         if !is_already_admin {
             create_ctrl(
                 0, "BUTTON", "Vernichten (Standard)",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                18, 304, 150, 32, hwnd, 101, H_FONT_REGULAR,
+                18, btn_y, 150, 32, hwnd, 101, H_FONT_REGULAR,
             );
             create_ctrl(
                 0, "BUTTON", "Als Administrator vernichten",
                 WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP,
-                176, 304, 230, 32, hwnd, 102, H_FONT_BOLD,
+                176, btn_y, 230, 32, hwnd, 102, H_FONT_BOLD,
             );
             create_ctrl(
                 0, "BUTTON", "Abbrechen",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                414, 304, 108, 32, hwnd, 103, H_FONT_REGULAR,
+                414, btn_y, 108, 32, hwnd, 103, H_FONT_REGULAR,
             );
         } else {
             create_ctrl(
                 0, "BUTTON", "Vernichten inkl. USN-Journal",
                 WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP,
-                18, 304, 230, 32, hwnd, 102, H_FONT_BOLD,
+                18, btn_y, 230, 32, hwnd, 102, H_FONT_BOLD,
             );
             create_ctrl(
                 0, "BUTTON", "Schnellvernichtung",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                256, 304, 150, 32, hwnd, 101, H_FONT_REGULAR,
+                256, btn_y, 150, 32, hwnd, 101, H_FONT_REGULAR,
             );
             create_ctrl(
                 0, "BUTTON", "Abbrechen",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                414, 304, 108, 32, hwnd, 103, H_FONT_REGULAR,
+                414, btn_y, 108, 32, hwnd, 103, H_FONT_REGULAR,
             );
         }
 
@@ -2809,11 +3664,337 @@ pub fn show_confirmation_dialog(paths: &[PathBuf], is_already_admin: bool) -> Co
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            if IsDialogMessageW(hwnd, &msg) == 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
 
-        CONFIRMATION_CHOICE
+        (CONFIRMATION_CHOICE, CONFIRM_SKIP_CHECKED)
+    }
+}
+
+// ==========================================
+// Letzte Warnung mit 2-Sekunden-Countdown (#17)
+// ==========================================
+
+const ID_FINAL_CONFIRM: usize = 201;
+const ID_FINAL_CHK_SKIP: usize = 202;
+const ID_FINAL_TIMER: usize = 1;
+
+static FINAL_COUNTDOWN: AtomicI32 = AtomicI32::new(2);
+static mut FINAL_CONFIRMED: bool = false;
+static mut FINAL_HDR_TITLE: *mut c_void = std::ptr::null_mut();
+static mut FINAL_HDR_SUB: *mut c_void = std::ptr::null_mut();
+static mut FINAL_LBL_IMPORTANT: *mut c_void = std::ptr::null_mut();
+static mut FINAL_BTN_CONFIRM: *mut c_void = std::ptr::null_mut();
+static mut FINAL_CHK_SKIP: *mut c_void = std::ptr::null_mut();
+static mut FINAL_SKIP_CHECKED: bool = false;
+
+unsafe extern "system" fn final_warning_wnd_proc(
+    hwnd: *mut c_void,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    unsafe {
+        match msg {
+            WM_TIMER => {
+                if wparam == ID_FINAL_TIMER {
+                    let prev = FINAL_COUNTDOWN.load(Ordering::SeqCst);
+                    let remaining = if prev > 0 {
+                        let next = prev - 1;
+                        FINAL_COUNTDOWN.store(next, Ordering::SeqCst);
+                        next
+                    } else {
+                        0
+                    };
+                    if remaining > 0 {
+                        let txt = format!("Bestätigen ({})", remaining);
+                        let w_txt = to_wide_chars(&txt);
+                        SetWindowTextW(FINAL_BTN_CONFIRM, w_txt.as_ptr());
+                    } else {
+                        KillTimer(hwnd, ID_FINAL_TIMER);
+                        let w_txt = to_wide_chars("Bestätigen");
+                        SetWindowTextW(FINAL_BTN_CONFIRM, w_txt.as_ptr());
+                        EnableWindow(FINAL_BTN_CONFIRM, 1);
+                        SendMessageW(FINAL_BTN_CONFIRM, BM_SETSTYLE, BS_DEFPUSHBUTTON as usize, 1);
+                        SendMessageW(hwnd, DM_SETDEFID, ID_FINAL_CONFIRM, 0);
+                        SetFocus(FINAL_BTN_CONFIRM);
+                    }
+                }
+                0
+            }
+            WM_COMMAND => {
+                let id = wparam & 0xFFFF;
+                if id == ID_FINAL_CONFIRM {
+                    if FINAL_COUNTDOWN.load(Ordering::SeqCst) <= 0 {
+                        if !FINAL_CHK_SKIP.is_null() {
+                            FINAL_SKIP_CHECKED =
+                                SendMessageW(FINAL_CHK_SKIP, BM_GETCHECK, 0, 0) == BST_CHECKED as isize;
+                        }
+                        FINAL_CONFIRMED = true;
+                        DestroyWindow(hwnd);
+                    }
+                } else if id == 2 /* IDCANCEL */ {
+                    FINAL_CONFIRMED = false;
+                    DestroyWindow(hwnd);
+                }
+                0
+            }
+            WM_CTLCOLORSTATIC => {
+                let hdc = wparam as *mut c_void;
+                let h_ctrl = lparam as *mut c_void;
+                SetBkMode(hdc, 1 /* TRANSPARENT */);
+
+                if h_ctrl == FINAL_HDR_TITLE || h_ctrl == FINAL_HDR_SUB {
+                    if h_ctrl == FINAL_HDR_TITLE {
+                        SetTextColor(hdc, 0x001414B4); // Warn-Rot
+                    } else {
+                        SetTextColor(hdc, 0x00000000);
+                    }
+                    SetBkColor(hdc, 0x00FFFFFF);
+                    H_BRUSH_WHITE as isize
+                } else {
+                    if !FINAL_LBL_IMPORTANT.is_null() && h_ctrl == FINAL_LBL_IMPORTANT {
+                        SetTextColor(hdc, 0x001414B4); // Rot
+                    } else {
+                        SetTextColor(hdc, 0x00000000);
+                    }
+                    SetBkColor(hdc, 0x00F0F0F0);
+                    H_BRUSH_DIALOG as isize
+                }
+            }
+            WM_PAINT => {
+                let mut ps: PAINTSTRUCT = std::mem::zeroed();
+                let hdc = BeginPaint(hwnd, &mut ps);
+
+                let rc_top = RECT { left: 0, top: 0, right: 500, bottom: 72 };
+                FillRect(hdc, &rc_top, H_BRUSH_WHITE);
+
+                let rc_line = RECT { left: 0, top: 72, right: 500, bottom: 73 };
+                FillRect(hdc, &rc_line, H_BRUSH_LINE);
+
+                let rc_bottom = RECT { left: 0, top: 73, right: 500, bottom: 290 };
+                FillRect(hdc, &rc_bottom, H_BRUSH_DIALOG);
+
+                let h_inst = GetModuleHandleW(std::ptr::null());
+                let h_icon = LoadImageW(h_inst, 1 as *const u16, 1, 32, 32, LR_SHARED);
+                if !h_icon.is_null() {
+                    DrawIconEx(hdc, 20, 20, h_icon, 32, 32, 0, std::ptr::null_mut(), 0x0003);
+                }
+
+                EndPaint(hwnd, &ps);
+                0
+            }
+            WM_CLOSE => {
+                FINAL_CONFIRMED = false;
+                DestroyWindow(hwnd);
+                0
+            }
+            WM_DESTROY => {
+                KillTimer(hwnd, ID_FINAL_TIMER);
+                PostQuitMessage(0);
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
+/// Zeigt die kompakte „Letzte Warnung“ mit einem 2-Sekunden-Countdown auf dem Bestätigen-Button an.
+/// Erst nach Ablauf des Countdowns ist der Button aktiv und per `Enter` auslösbar.
+pub fn show_final_warning_dialog(
+    paths: &[PathBuf],
+    important_reasons: &[String],
+    admin_purge_active: bool,
+    force_prompt: bool,
+) -> (bool, bool) {
+    unsafe {
+        FINAL_CONFIRMED = false;
+        FINAL_COUNTDOWN.store(2, Ordering::SeqCst);
+        FINAL_LBL_IMPORTANT = std::ptr::null_mut();
+        FINAL_BTN_CONFIRM = std::ptr::null_mut();
+        FINAL_CHK_SKIP = std::ptr::null_mut();
+        FINAL_SKIP_CHECKED = get_skip_safety_prompt();
+        init_gui_resources();
+
+        let instance = GetModuleHandleW(std::ptr::null());
+        let class_name = to_wide_chars("WinShredFinalWarningClass");
+
+        let mut wnd_class: WNDCLASSEXW = std::mem::zeroed();
+        wnd_class.cb_size = std::mem::size_of::<WNDCLASSEXW>() as u32;
+        wnd_class.style = 0x0002 | 0x0001;
+        wnd_class.lpfn_wnd_proc = Some(final_warning_wnd_proc);
+        wnd_class.h_instance = instance;
+        wnd_class.h_cursor = LoadCursorW(std::ptr::null_mut(), 32512 as *const u16);
+        wnd_class.h_icon = LoadImageW(instance, 1 as *const u16, 1, 32, 32, LR_SHARED);
+        wnd_class.h_icon_sm = LoadImageW(instance, 1 as *const u16, 1, 16, 16, LR_SHARED);
+        wnd_class.lpsz_class_name = class_name.as_ptr();
+
+        RegisterClassExW(&wnd_class);
+
+        let has_important = !important_reasons.is_empty();
+        let client_h = if has_important { 268 } else { 222 };
+
+        let mut rc = RECT { left: 0, top: 0, right: 500, bottom: client_h };
+        let win_style = 0x00C00000 | 0x00080000; // WS_CAPTION | WS_SYSMENU
+        AdjustWindowRectEx(&mut rc, win_style, 0, 0);
+        let win_w = rc.right - rc.left;
+        let win_h = rc.bottom - rc.top;
+
+        let screen_w = GetSystemMetrics(0);
+        let screen_h = GetSystemMetrics(1);
+        let pos_x = (screen_w - win_w) / 2;
+        let pos_y = (screen_h - win_h) / 2;
+
+        let window_title = to_wide_chars("WinShred - Letzte Warnung");
+
+        let hwnd = CreateWindowExW(
+            0x00040000, // WS_EX_TOPMOST
+            class_name.as_ptr(),
+            window_title.as_ptr(),
+            win_style,
+            pos_x,
+            pos_y,
+            win_w,
+            win_h,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            instance,
+            std::ptr::null_mut(),
+        );
+
+        if hwnd.is_null() {
+            return (false, FINAL_SKIP_CHECKED);
+        }
+
+        SendMessageW(hwnd, 0x0080 /* WM_SETICON */, 1 /* ICON_BIG */, wnd_class.h_icon as isize);
+        SendMessageW(hwnd, 0x0080 /* WM_SETICON */, 0 /* ICON_SMALL */, wnd_class.h_icon_sm as isize);
+
+        let title_text = if has_important {
+            "ACHTUNG: Relevanter System-/Profilordner!"
+        } else {
+            "Letzte Warnung: Unwiderrufliches Vernichten"
+        };
+
+        let target_label = if paths.len() == 1 {
+            shorten_path_display(&paths[0].to_string_lossy(), 52)
+        } else {
+            format!("{} ausgewählte Elemente", paths.len())
+        };
+        let mode_suffix = if admin_purge_active {
+            " (Admin inkl. USN-Journal)"
+        } else {
+            ""
+        };
+        let sub_text = format!("Ziel: {}{}", target_label, mode_suffix);
+
+        FINAL_HDR_TITLE = create_ctrl(
+            0, "STATIC", title_text,
+            WS_CHILD | WS_VISIBLE, 64, 14, 416, 22, hwnd, 0, H_FONT_TITLE,
+        );
+        FINAL_HDR_SUB = create_ctrl(
+            0, "STATIC", &sub_text,
+            WS_CHILD | WS_VISIBLE, 64, 40, 416, 24, hwnd, 0, H_FONT_SUBTITLE,
+        );
+
+        create_ctrl(
+            0,
+            "STATIC",
+            "Die ausgewählten Daten werden sofort überschrieben und endgültig gelöscht.\nBitte warten Sie kurz (2 Sekunden) und bestätigen Sie erst dann zum Löschen.",
+            WS_CHILD | WS_VISIBLE,
+            22,
+            88,
+            456,
+            34,
+            hwnd,
+            0,
+            H_FONT_REGULAR,
+        );
+
+        let mut next_y = 132;
+        if has_important {
+            let reason = important_reasons
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or("Relevanter System-, Programm- oder Profilordner");
+            let imp_text = format!(
+                "Erzwungene Sicherheitsprüfung: {}",
+                shorten_path_display(reason, 60)
+            );
+            FINAL_LBL_IMPORTANT = create_ctrl(
+                0, "STATIC", &imp_text,
+                WS_CHILD | WS_VISIBLE, 22, next_y, 456, 36, hwnd, 0, H_FONT_BOLD,
+            );
+            next_y += 44;
+        }
+
+        let skip_text = if force_prompt {
+            "Normale Sicherheitsprüfung überspringen (für wichtige Ordner immer aktiv)"
+        } else {
+            "Sicherheitsprüfung in Zukunft überspringen"
+        };
+        FINAL_CHK_SKIP = create_ctrl(
+            0,
+            "BUTTON",
+            skip_text,
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
+            22,
+            next_y,
+            456,
+            20,
+            hwnd,
+            ID_FINAL_CHK_SKIP,
+            H_FONT_REGULAR,
+        );
+        if FINAL_SKIP_CHECKED {
+            SendMessageW(FINAL_CHK_SKIP, BM_SETCHECK, BST_CHECKED, 0);
+        }
+
+        let btn_y = client_h - 46;
+        FINAL_BTN_CONFIRM = create_ctrl(
+            0,
+            "BUTTON",
+            "Bestätigen (2)",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP | WS_DISABLED,
+            210,
+            btn_y,
+            150,
+            32,
+            hwnd,
+            ID_FINAL_CONFIRM,
+            H_FONT_BOLD,
+        );
+        create_ctrl(
+            0,
+            "BUTTON",
+            "Abbrechen",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+            370,
+            btn_y,
+            108,
+            32,
+            hwnd,
+            2, // IDCANCEL
+            H_FONT_REGULAR,
+        );
+
+        // Solange der 2-Sekunden-Countdown läuft, darf Enter NICHT bestätigen
+        SendMessageW(hwnd, DM_SETDEFID, 0, 0);
+        SetTimer(hwnd, ID_FINAL_TIMER, 1000, std::ptr::null_mut());
+        force_foreground_window(hwnd);
+        SetFocus(hwnd);
+
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+            if IsDialogMessageW(hwnd, &msg) == 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+
+        (FINAL_CONFIRMED, FINAL_SKIP_CHECKED)
     }
 }
 
@@ -2894,6 +4075,13 @@ fn count_items_and_bytes(paths: &[PathBuf], num_passes: usize, cancel_flag: &Ato
 // Fortschritts-Dialog (Progress Dialog)
 // ==========================================
 
+pub struct ShredOutcome {
+    pub cancelled: bool,
+    pub errors: usize,
+    pub journal_purged: bool,
+    pub journal_errors: usize,
+}
+
 struct ShredProgressShared {
     total_items: usize,
     processed_items: usize,
@@ -2904,6 +4092,8 @@ struct ShredProgressShared {
     cancelled: bool,
     completed: bool,
     errors: usize,
+    journal_purged: bool,
+    journal_errors: usize,
 }
 
 struct ProgressDialogControls {
@@ -2977,7 +4167,7 @@ unsafe extern "system" fn progress_dialog_wnd_proc(
 
                 // 4. Logo / Icon im Header
                 let h_inst = GetModuleHandleW(std::ptr::null());
-                let h_icon = LoadImageW(h_inst, 1 as *const u16, 1, 32, 32, 0);
+                let h_icon = LoadImageW(h_inst, 1 as *const u16, 1, 32, 32, LR_SHARED);
                 if !h_icon.is_null() {
                     DrawIconEx(hdc, 20, 18, h_icon, 32, 32, 0, std::ptr::null_mut(), 0x0003);
                 }
@@ -3120,7 +4310,7 @@ pub fn show_shred_progress_dialog(
     num_passes: usize,
     purge_journal: bool,
     is_admin: bool,
-) -> (bool, usize) {
+) -> ShredOutcome {
     unsafe {
         init_gui_resources();
 
@@ -3139,8 +4329,8 @@ pub fn show_shred_progress_dialog(
         wnd_class.lpfn_wnd_proc = Some(progress_dialog_wnd_proc);
         wnd_class.h_instance = instance;
         wnd_class.h_cursor = LoadCursorW(std::ptr::null_mut(), 32512 as *const u16);
-        wnd_class.h_icon = LoadImageW(instance, 1 as *const u16, 1, 32, 32, 0);
-        wnd_class.h_icon_sm = LoadImageW(instance, 1 as *const u16, 1, 16, 16, 0);
+        wnd_class.h_icon = LoadImageW(instance, 1 as *const u16, 1, 32, 32, LR_SHARED);
+        wnd_class.h_icon_sm = LoadImageW(instance, 1 as *const u16, 1, 16, 16, LR_SHARED);
         wnd_class.lpsz_class_name = class_name.as_ptr();
 
         RegisterClassExW(&wnd_class);
@@ -3174,7 +4364,12 @@ pub fn show_shred_progress_dialog(
         );
 
         if hwnd.is_null() {
-            return (false, 0);
+            return ShredOutcome {
+                cancelled: false,
+                errors: 1,
+                journal_purged: false,
+                journal_errors: 0,
+            };
         }
 
         SendMessageW(hwnd, 0x0080 /* WM_SETICON */, 1 /* ICON_BIG */, wnd_class.h_icon as isize);
@@ -3251,6 +4446,8 @@ pub fn show_shred_progress_dialog(
             cancelled: false,
             completed: false,
             errors: 0,
+            journal_purged: false,
+            journal_errors: 0,
         }));
 
         if let Ok(mut guard) = PROG_SHARED.lock() {
@@ -3305,8 +4502,8 @@ pub fn show_shred_progress_dialog(
                 if PROG_CANCEL.load(Ordering::SeqCst) {
                     break;
                 }
-                if let Some(root) = path.components().next() {
-                    affected_volumes.insert(PathBuf::from(root.as_os_str()));
+                if let Some(drive) = extract_drive_letter(path) {
+                    affected_volumes.insert(PathBuf::from(format!("{}\\", drive)));
                 }
                 shred_recursive_with_reporter(path, num_passes, &mut errors, &mut reporter);
             }
@@ -3314,6 +4511,8 @@ pub fn show_shred_progress_dialog(
             reporter.flush_updates();
 
             // 3. USN Journal Purge (wenn gewünscht & Admin & nicht abgebrochen)
+            let mut journal_purged = false;
+            let mut journal_errors = 0usize;
             if purge_journal && is_admin && !PROG_CANCEL.load(Ordering::SeqCst) {
                 if let Ok(mut g) = shared_clone.lock() {
                     g.detail_status = "NTFS USN-Journal ($UsnJrnl) wird bereinigt...".to_string();
@@ -3323,7 +4522,14 @@ pub fn show_shred_progress_dialog(
                     if PROG_CANCEL.load(Ordering::SeqCst) {
                         break;
                     }
-                    let _ = purge_volume_usn_journal(vol);
+                    match purge_volume_usn_journal(vol) {
+                        Ok(true) => journal_purged = true,
+                        Ok(false) => {}
+                        Err(e) => {
+                            journal_errors += 1;
+                            eprintln!("USN-Journal-Bereinigung fehlgeschlagen für {:?}: {}", vol, e);
+                        }
+                    }
                 }
             }
 
@@ -3333,6 +4539,8 @@ pub fn show_shred_progress_dialog(
                 g.errors = errors;
                 g.cancelled = cancelled;
                 g.completed = true;
+                g.journal_purged = journal_purged;
+                g.journal_errors = journal_errors;
                 if !cancelled {
                     g.processed_items = g.total_items;
                     g.processed_bytes = g.total_bytes;
@@ -3347,33 +4555,40 @@ pub fn show_shred_progress_dialog(
         // Message Loop
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            if IsDialogMessageW(hwnd, &msg) == 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
 
         // Sicherstellen, dass Worker-Thread sauber beendet ist
         PROG_CANCEL.store(true, Ordering::SeqCst);
         let _ = worker_handle.join();
 
-        let (was_cancelled, errors) = if let Ok(guard_opt) = PROG_SHARED.lock() {
+        let outcome = if let Ok(guard_opt) = PROG_SHARED.lock() {
             if let Some(ref shared_arc) = *guard_opt {
                 if let Ok(data) = shared_arc.lock() {
-                    (data.cancelled, data.errors)
+                    ShredOutcome {
+                        cancelled: data.cancelled,
+                        errors: data.errors,
+                        journal_purged: data.journal_purged,
+                        journal_errors: data.journal_errors,
+                    }
                 } else {
-                    (false, 0)
+                    ShredOutcome { cancelled: false, errors: 0, journal_purged: false, journal_errors: 0 }
                 }
             } else {
-                (false, 0)
+                ShredOutcome { cancelled: false, errors: 0, journal_purged: false, journal_errors: 0 }
             }
         } else {
-            (false, 0)
+            ShredOutcome { cancelled: false, errors: 0, journal_purged: false, journal_errors: 0 }
         };
 
         if let Ok(mut guard_opt) = PROG_SHARED.lock() {
             *guard_opt = None;
         }
 
-        (was_cancelled, errors)
+        outcome
     }
 }
 
@@ -3402,6 +4617,15 @@ fn main() {
         let _ = run_uninstall_backend();
         return;
     }
+    if args.iter().any(|a| a == "--reset-prompts") {
+        set_skip_safety_prompt(false);
+        show_message_box(
+            "Die Sicherheitsprüfung vor dem Vernichten wurde wieder aktiviert.",
+            "WinShred - Einstellung zurückgesetzt",
+            MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND,
+        );
+        return;
+    }
 
     // 2. Ohne Parameter gestartet (Doppelklick auf die EXE) -> Installer Wizard
     if args.is_empty() {
@@ -3419,6 +4643,7 @@ fn main() {
     let mut auto_confirm = false;
     let mut is_quiet = false;
     let mut purge_journal = false;
+    let mut elevated_confirmed = false;
     let mut custom_passes = None;
 
     let mut iter = args.into_iter();
@@ -3429,8 +4654,10 @@ fn main() {
         } else if arg == "-y" || arg == "--yes" {
             auto_confirm = true;
         } else if arg == "--admin" || arg == "--admin-purge" {
-            // Relaunch mit Admin-Rechten: auto_confirm bleibt bewusst FALSE,
-            // damit der Dialog auch als Administrator zur Bestätigung angezeigt wird!
+            purge_journal = true;
+        } else if arg == "--elevated-confirmed" {
+            // Direkt über „Als Administrator vernichten“ gestartet: kein doppeltes Auswahlfenster
+            elevated_confirmed = true;
             purge_journal = true;
         } else if arg == "--purge-journal" || arg == "-p" {
             purge_journal = true;
@@ -3442,7 +4669,7 @@ fn main() {
             }
         } else {
             let p = PathBuf::from(arg);
-            if p.exists() || fs::symlink_metadata(&p).is_ok() {
+            if fs::symlink_metadata(&p).is_ok() || p.exists() {
                 paths_to_shred.push(p);
             }
         }
@@ -3457,15 +4684,34 @@ fn main() {
         return;
     }
 
-    // Sicherheitsprüfung: Schutz vor versehentlichem Vernichten von Roots oder Systemverzeichnissen
-    let (dangerous_paths, valid_paths): (Vec<_>, Vec<_>) = paths_to_shred
-        .into_iter()
-        .partition(|p| is_dangerous_or_root_path(p));
+    // Sicherheitsprüfung (#5 & #18): Blockade für Systemkern/Roots und erzwungene Warnung für relevante Ordner
+    let mut dangerous_paths: Vec<(PathBuf, String)> = Vec::new();
+    let mut valid_paths: Vec<PathBuf> = Vec::new();
+    let mut important_reasons: Vec<String> = Vec::new();
+
+    for p in paths_to_shred {
+        match classify_path_safety(&p) {
+            PathSafetyLevel::Blocked(reason) => {
+                dangerous_paths.push((p, reason));
+            }
+            PathSafetyLevel::Important(reason) => {
+                important_reasons.push(format!("{} ({})", p.display(), reason));
+                valid_paths.push(p);
+            }
+            PathSafetyLevel::Safe => {
+                valid_paths.push(p);
+            }
+        }
+    }
 
     if !dangerous_paths.is_empty() {
         let msg = format!(
             "Sicherheitsblockade:\n\nFolgende Stamm- oder Systemverzeichnisse dürfen aus Sicherheitsgründen nicht vernichtet werden:\n\n{}\n\nDer Vorgang wurde für diese Verzeichnisse blockiert.",
-            dangerous_paths.iter().map(|p| format!("- {}", p.display())).collect::<Vec<_>>().join("\n")
+            dangerous_paths
+                .iter()
+                .map(|(p, r)| format!("- {} ({})", p.display(), r))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
         show_message_box(&msg, "WinShred - Schutzfunktion", MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
     }
@@ -3475,33 +4721,54 @@ fn main() {
     }
 
     let is_admin = unsafe { IsUserAnAdmin() } != 0;
+    let has_important = !important_reasons.is_empty();
+    let skip_saved = get_skip_safety_prompt();
+    let should_prompt = !auto_confirm && (has_important || !skip_saved);
 
-    // Sicherheitsabfrage vor dem Vernichten
-    if !auto_confirm {
-        let choice = show_confirmation_dialog(&valid_paths, is_admin);
-        match choice {
-            ConfirmationResult::Cancel => return,
-            ConfirmationResult::ShredStandard => {
-                purge_journal = false;
-            }
-            ConfirmationResult::ShredAsAdmin => {
-                if !is_admin {
-                    let mut params = String::from("--admin ");
-                    if let Some(p_count) = custom_passes {
-                        params.push_str(&format!("--passes {} ", p_count));
+    // Sicherheitsabfrage vor dem Vernichten (#17 & #18)
+    if should_prompt {
+        if !elevated_confirmed {
+            let (choice, skip_checked) = show_confirmation_dialog(&valid_paths, is_admin, &important_reasons);
+            match choice {
+                ConfirmationResult::Cancel => return,
+                ConfirmationResult::ShredStandard => {
+                    set_skip_safety_prompt(skip_checked);
+                    purge_journal = false;
+                }
+                ConfirmationResult::ShredAsAdmin => {
+                    set_skip_safety_prompt(skip_checked);
+                    if !is_admin {
+                        let mut parts = vec![
+                            String::from("--admin"),
+                            String::from("--elevated-confirmed"),
+                        ];
+                        if let Some(p_count) = custom_passes {
+                            parts.push(String::from("--passes"));
+                            parts.push(p_count.to_string());
+                        }
+                        for p in &valid_paths {
+                            parts.push(quote_windows_cli_arg(&p.to_string_lossy()));
+                        }
+                        elevate_relaunch(&parts.join(" "));
+                        return;
+                    } else {
+                        purge_journal = true;
                     }
-                    for p in &valid_paths {
-                        params.push('"');
-                        params.push_str(&p.to_string_lossy());
-                        params.push_str("\" ");
-                    }
-                    elevate_relaunch(&params);
-                    return;
-                } else {
-                    purge_journal = true;
                 }
             }
         }
+
+        // Kompakte „Letzte Warnung“ mit 2-Sekunden-Countdown (auch direkt nach Admin-Elevation!)
+        let (confirmed, skip_checked_final) = show_final_warning_dialog(
+            &valid_paths,
+            &important_reasons,
+            purge_journal && is_admin,
+            has_important,
+        );
+        if !confirmed {
+            return;
+        }
+        set_skip_safety_prompt(skip_checked_final);
     }
 
     let num_passes = custom_passes.unwrap_or(1);
@@ -3513,21 +4780,32 @@ fn main() {
     }
 
     // Ausführung: Entweder Headless (wenn --quiet) oder mit grafischem Fortschrittsbalken
-    let (was_cancelled, errors) = if is_quiet {
+    let outcome = if is_quiet {
         let mut errs = 0;
         let mut affected_volumes = std::collections::HashSet::new();
         for path in &valid_paths {
-            if let Some(root) = path.components().next() {
-                affected_volumes.insert(PathBuf::from(root.as_os_str()));
+            if let Some(drive) = extract_drive_letter(path) {
+                affected_volumes.insert(PathBuf::from(format!("{}\\", drive)));
             }
             shred_recursive(path, num_passes, &mut errs);
         }
+        let mut journal_purged = false;
+        let mut journal_errors = 0usize;
         if purge_journal && is_admin {
             for vol in &affected_volumes {
-                let _ = purge_volume_usn_journal(vol);
+                match purge_volume_usn_journal(vol) {
+                    Ok(true) => journal_purged = true,
+                    Ok(false) => {}
+                    Err(_) => journal_errors += 1,
+                }
             }
         }
-        (false, errs)
+        ShredOutcome {
+            cancelled: false,
+            errors: errs,
+            journal_purged,
+            journal_errors,
+        }
     } else {
         show_shred_progress_dialog(
             &valid_paths,
@@ -3538,20 +4816,29 @@ fn main() {
     };
 
     if !is_quiet {
-        if was_cancelled {
+        if outcome.cancelled {
             show_message_box(
                 "Der Vernichtungsvorgang wurde durch den Benutzer abgebrochen.\nEinige Elemente wurden möglicherweise bereits vernichtet.",
                 "WinShred - Abgebrochen",
                 MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND,
             );
-        } else if errors > 0 {
+        } else if outcome.errors > 0 {
             show_message_box(
-                &format!("WinShred abgeschlossen, aber bei {} Element(en) gab es Zugriffsfehler.", errors),
+                &format!("WinShred abgeschlossen, aber bei {} Element(en) gab es Zugriffsfehler.", outcome.errors),
                 "WinShred - Hinweis",
                 MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND,
             );
+        } else if outcome.journal_errors > 0 {
+            show_message_box(
+                &format!(
+                    "Dateien wurden unwiderruflich vernichtet, aber das NTFS USN-Journal konnte auf {} Laufwerk(en) nicht bereinigt werden.",
+                    outcome.journal_errors
+                ),
+                "WinShred - Hinweis zur Journal-Bereinigung",
+                MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND,
+            );
         } else if !auto_confirm {
-            let msg = if purge_journal && is_admin {
+            let msg = if outcome.journal_purged {
                 "WinShred erfolgreich abgeschlossen.\nAlle ausgewählten Elemente wurden unwiderruflich vernichtet und das NTFS USN-Journal wurde bereinigt."
             } else {
                 "WinShred erfolgreich abgeschlossen.\nAlle ausgewählten Elemente wurden unwiderruflich vernichtet."
@@ -3833,6 +5120,229 @@ mod tests {
 
         let _ = fs::remove_file(&file1);
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_usn_journal_structs_and_constants() {
+        assert_eq!(std::mem::size_of::<USN_JOURNAL_DATA_V0>(), 56);
+        assert_eq!(FSCTL_DELETE_USN_JOURNAL, 0x000900F8);
+        assert_eq!(FSCTL_QUERY_USN_JOURNAL, 0x000900F4);
+        assert_eq!(FSCTL_CREATE_USN_JOURNAL, 0x000900E7);
+        assert_eq!(FSCTL_QUERY_ALLOCATED_RANGES, 0x000940CF);
+
+        // Relative Pfade müssen über extract_drive_letter trotzdem ein Laufwerk liefern
+        let rel = Path::new("Cargo.toml");
+        let drive = extract_drive_letter(rel);
+        assert!(drive.is_some(), "Laufwerksbuchstabe für relativen Pfad sollte ermittelt werden");
+    }
+
+    #[test]
+    fn test_non_resident_small_file_not_mft_resident() {
+        let temp_dir = env::temp_dir().join(format!("winshred_nonres_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let fpath = temp_dir.join("shrunk.bin");
+
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&fpath)
+                .unwrap();
+            f.write_all(&vec![b'Z'; 16384]).unwrap();
+            f.sync_all().unwrap();
+            f.set_len(100).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        {
+            let f = OpenOptions::new().read(true).open(&fpath).unwrap();
+            assert!(
+                !is_file_resident_in_mft(&f, 100),
+                "Verkleinerte Datei mit belegtem Cluster darf nicht als resident eingestuft werden"
+            );
+        }
+
+        shred_file(&fpath, 1).unwrap();
+        assert!(!fpath.exists());
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sparse_file_allocated_range_shred() {
+        const FSCTL_SET_SPARSE: u32 = 0x000900C4;
+        let temp_dir = env::temp_dir().join(format!("winshred_sparse_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let sp = temp_dir.join("sparse_data.bin");
+
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&sp)
+                .unwrap();
+            let mut bret = 0u32;
+            let ok = unsafe {
+                DeviceIoControl(
+                    f.as_raw_handle(),
+                    FSCTL_SET_SPARSE,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut bret,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok != 0 {
+                f.set_len(8 * 1024 * 1024).unwrap();
+                f.seek(SeekFrom::Start(4 * 1024 * 1024)).unwrap();
+                f.write_all(&vec![0xAB; 4096]).unwrap();
+                f.sync_all().unwrap();
+
+                let ranges = query_allocated_ranges(&f, 8 * 1024 * 1024).unwrap();
+                assert!(!ranges.is_empty(), "Mindestens ein allokierter Bereich bei 4 MB erwartet");
+                assert!(
+                    ranges.iter().any(|&(off, len)| off <= 4 * 1024 * 1024 && off + len >= 4 * 1024 * 1024 + 4096),
+                    "Gefundene Bereiche sollten den Block bei 4 MB abdecken: {:?}",
+                    ranges
+                );
+            }
+        }
+
+        shred_file(&sp, 1).unwrap();
+        assert!(!sp.exists());
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_move_file_no_replace_prevents_overwrite() {
+        let temp_dir = env::temp_dir().join(format!("winshred_noreplace_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let f1 = temp_dir.join("source.txt");
+        let f2 = temp_dir.join("existing.txt");
+        fs::write(&f1, b"source").unwrap();
+        fs::write(&f2, b"must_survive").unwrap();
+
+        let err = move_file_no_replace(&f1, &f2).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&f2).unwrap(), "must_survive");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_readonly_and_ads_preserved_when_locked() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let temp_dir = env::temp_dir().join(format!("winshred_lock_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let fpath = temp_dir.join("locked_ro.txt");
+        fs::write(&fpath, b"locked_payload").unwrap();
+
+        let ads_path = format!("{}:keep_ads:$DATA", fpath.to_string_lossy());
+        {
+            let mut ads = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&ads_path)
+                .unwrap();
+            ads.write_all(b"ads_content").unwrap();
+        }
+
+        // Exklusives Handle halten (share_mode(0)), danach Read-Only setzen
+        let lock_handle = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&fpath)
+            .unwrap();
+
+        let wide = path_to_wide(&fpath);
+        let orig_attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
+        unsafe { SetFileAttributesW(wide.as_ptr(), orig_attrs | FILE_ATTRIBUTE_READONLY) };
+
+        let res = shred_file(&fpath, 1);
+        assert!(res.is_err(), "Gesperrte Datei darf nicht geschreddert werden");
+
+        let attrs_after = unsafe { GetFileAttributesW(wide.as_ptr()) };
+        assert_ne!(attrs_after & FILE_ATTRIBUTE_READONLY, 0, "ReadOnly-Attribut muss erhalten bleiben");
+
+        drop(lock_handle);
+        assert_eq!(fs::read_to_string(&ads_path).unwrap(), "ads_content");
+
+        unsafe { SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_NORMAL) };
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_classify_path_safety_rules() {
+        assert!(matches!(classify_path_safety(Path::new("C:\\")), PathSafetyLevel::Blocked(_)));
+        assert!(matches!(classify_path_safety(Path::new(r"\\server\share")), PathSafetyLevel::Blocked(_)));
+        assert!(matches!(classify_path_safety(Path::new(r"\\server\share\sub\file.txt")), PathSafetyLevel::Safe));
+        assert!(matches!(classify_path_safety(Path::new(r"C:\Windows")), PathSafetyLevel::Blocked(_)));
+        assert!(matches!(classify_path_safety(Path::new(r"C:\Windows\System32")), PathSafetyLevel::Blocked(_)));
+        assert!(matches!(classify_path_safety(Path::new(r"C:\Windows\SysWOW64\cmd.exe")), PathSafetyLevel::Blocked(_)));
+        assert!(matches!(classify_path_safety(Path::new(r"C:\Windows\Temp\test.log")), PathSafetyLevel::Important(_)));
+        assert!(matches!(classify_path_safety(Path::new(r"C:\Windows\System32_backup")), PathSafetyLevel::Important(_)));
+        assert!(matches!(classify_path_safety(Path::new(r"D:\System Volume Information")), PathSafetyLevel::Blocked(_)));
+        assert!(matches!(classify_path_safety(Path::new(r"C:\ProgramData")), PathSafetyLevel::Blocked(_)));
+        assert!(matches!(classify_path_safety(Path::new(r"C:\ProgramData\MyApp")), PathSafetyLevel::Important(_)));
+
+        if let Ok(profile) = env::var("USERPROFILE") {
+            assert!(matches!(classify_path_safety(Path::new(&profile)), PathSafetyLevel::Important(_)));
+            assert!(matches!(
+                classify_path_safety(&Path::new(&profile).join("Desktop")),
+                PathSafetyLevel::Important(_)
+            ));
+            assert!(matches!(
+                classify_path_safety(&Path::new(&profile).join("Desktop").join("einzeldatei.txt")),
+                PathSafetyLevel::Safe
+            ));
+        }
+
+        let safe_tmp = env::temp_dir().join("winshred_safe_dummy.txt");
+        assert!(matches!(classify_path_safety(&safe_tmp), PathSafetyLevel::Safe));
+    }
+
+    #[test]
+    fn test_junction_to_windows_is_important_not_blocked() {
+        let temp_dir = env::temp_dir().join(format!("winshred_winjunc_{}", std::process::id()));
+        let link_dir = temp_dir.join("win_link");
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let status = Command::new("cmd")
+            .args(["/c", "mklink", "/J", &link_dir.to_string_lossy(), r"C:\Windows"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let level = classify_path_safety(&link_dir);
+        assert!(
+            matches!(level, PathSafetyLevel::Important(_)),
+            "Junction auf C:\\Windows darf nicht blockiert werden, sondern muss Important liefern: {:?}",
+            level
+        );
+
+        let mut errs = 0;
+        shred_recursive(&link_dir, 1, &mut errs);
+        assert_eq!(errs, 0);
+        assert!(!link_dir.exists());
+        assert!(Path::new(r"C:\Windows").exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_quote_windows_cli_arg_trailing_backslash() {
+        assert_eq!(quote_windows_cli_arg(r"C:\Simple\Path"), r"C:\Simple\Path");
+        assert_eq!(quote_windows_cli_arg(r"C:\Test Ordner\"), r#""C:\Test Ordner\\""#);
+        assert_eq!(quote_windows_cli_arg(""), r#""""#);
+        assert_eq!(quote_windows_cli_arg(r#"a\"b"#), r#""a\\\"b""#);
     }
 }
 
