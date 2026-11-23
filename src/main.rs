@@ -2307,6 +2307,7 @@ pub fn shred_recursive_with_reporter<R: ShredReporter>(
 
     if sym_meta.is_dir() {
         reporter.on_item_start(&clean_path, true);
+        let errors_before = *errors;
         match fs::read_dir(&clean_path) {
             Ok(entries) => {
                 for entry in entries {
@@ -2331,6 +2332,18 @@ pub fn shred_recursive_with_reporter<R: ShredReporter>(
         }
 
         if reporter.is_cancelled() {
+            return;
+        }
+
+        let has_child_errors = *errors > errors_before;
+        let still_has_entries = fs::read_dir(&clean_path)
+            .map(|mut it| it.next().is_some())
+            .unwrap_or(false);
+        if has_child_errors || still_has_entries {
+            if !has_child_errors {
+                *errors += 1;
+            }
+            reporter.on_item_done(&clean_path, true);
             return;
         }
 
@@ -3138,6 +3151,7 @@ unsafe fn update_wizard_page(hwnd: *mut c_void) {
                 SendMessageW(CTRLS.bar_p2_progress, PBM_SETMARQUEE, 1, 30);
             }
             WizardPage::Finish => {
+                SendMessageW(CTRLS.bar_p2_progress, PBM_SETMARQUEE, 0, 0);
                 set_lic_visible(false);
                 set_p1_install_visible(false);
                 set_p1_manage_visible(false);
@@ -5442,15 +5456,14 @@ fn relaunch_elevated_with_paths(
     valid_paths: &[PathBuf],
     custom_passes: Option<usize>,
     skip_checked: bool,
-) {
+) -> bool {
     let (mut parts, abs_paths, direct_parts) =
         build_elevated_relaunch_parts(valid_paths, custom_passes, skip_checked);
     let joined_direct = direct_parts.join(" ");
     let utf16_len: usize = joined_direct.encode_utf16().count();
 
     if utf16_len <= 28_000 {
-        let _ = elevate_relaunch(&joined_direct);
-        return;
+        return elevate_relaunch(&joined_direct);
     }
 
     let seq = ELEVATE_LIST_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -5463,11 +5476,13 @@ fn relaunch_elevated_with_paths(
     if fs::write(&list_path, body).is_ok() {
         parts.push(String::from("--cleanup-filelist"));
         parts.push(quote_windows_cli_arg(&list_path.to_string_lossy()));
-        if !elevate_relaunch(&parts.join(" ")) {
+        let ok = elevate_relaunch(&parts.join(" "));
+        if !ok {
             let _ = fs::remove_file(&list_path);
         }
+        ok
     } else {
-        let _ = elevate_relaunch(&joined_direct);
+        elevate_relaunch(&joined_direct)
     }
 }
 
@@ -5674,6 +5689,8 @@ fn main() {
         }
     }
 
+    let paths_to_shred = deduplicate_and_prune_nested_paths(paths_to_shred);
+
     // Sicherheitsprüfung (#5 & #18): Blockade für Systemkern/Roots und erzwungene Warnung für relevante Ordner
     let mut dangerous_paths: Vec<(PathBuf, String)> = Vec::new();
     let mut valid_paths: Vec<PathBuf> = Vec::new();
@@ -5717,8 +5734,6 @@ fn main() {
         return;
     }
 
-    let valid_paths = deduplicate_and_prune_nested_paths(valid_paths);
-
     // Auf HDDs standardmäßig 3-Pass DoD 5220.22-M; auf SSD/NVMe & residenten Dateien intern immer 1 Pass (#7)
     let num_passes = custom_passes.unwrap_or(3);
 
@@ -5741,7 +5756,13 @@ fn main() {
                 }
                 ConfirmationResult::ShredAsAdmin => {
                     if !is_admin {
-                        relaunch_elevated_with_paths(&valid_paths, custom_passes, skip_checked);
+                        if !relaunch_elevated_with_paths(&valid_paths, custom_passes, skip_checked) {
+                            report_cli_error(
+                                "Administratorrechte nicht erteilt (UAC abgebrochen oder fehlgeschlagen). Vorgang abgebrochen.",
+                                is_quiet,
+                            );
+                            std::process::exit(1);
+                        }
                         return;
                     } else {
                         initial_skip = skip_checked;
@@ -6693,6 +6714,33 @@ mod tests {
             "Relativer Pfad mit >240 Gesamtlänge muss Verbatim-Präfix erhalten: {}",
             wide_str
         );
+    }
+
+    #[test]
+    fn test_dir_not_renamed_when_child_locked() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let temp_dir = env::temp_dir().join(format!("winshred_dirlock_{}", std::process::id()));
+        let folder = temp_dir.join("mein_ordner");
+        fs::create_dir_all(&folder).unwrap();
+        let locked_file = folder.join("offen.txt");
+        fs::write(&locked_file, b"noch in benutzung").unwrap();
+
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&locked_file)
+            .unwrap();
+
+        let mut errs = 0;
+        shred_recursive(&folder, 1, &mut errs);
+        assert_eq!(errs, 1, "Genau ein Fehler für die gesperrte Datei erwartet, kein Doppelfehler für den Ordner");
+        assert!(folder.exists(), "Ordner darf bei gesperrtem Kind nicht in shred_*.tmp umbenannt werden");
+        assert!(locked_file.exists());
+
+        drop(lock);
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
 
