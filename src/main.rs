@@ -243,6 +243,24 @@ unsafe extern "system" {
     ) -> i32;
     fn RegDeleteValueW(hKey: *mut c_void, lpValueName: *const u16) -> i32;
     fn RegCloseKey(hKey: *mut c_void) -> i32;
+    fn OpenProcessToken(
+        ProcessHandle: *mut c_void,
+        DesiredAccess: u32,
+        TokenHandle: *mut *mut c_void,
+    ) -> i32;
+    fn LookupPrivilegeValueW(
+        lpSystemName: *const u16,
+        lpName: *const u16,
+        lpLuid: *mut LUID,
+    ) -> i32;
+    fn AdjustTokenPrivileges(
+        TokenHandle: *mut c_void,
+        DisableAllPrivileges: i32,
+        NewState: *const TOKEN_PRIVILEGES,
+        BufferLength: u32,
+        PreviousState: *mut c_void,
+        ReturnLength: *mut u32,
+    ) -> i32;
 }
 
 #[link(name = "shell32")]
@@ -341,6 +359,26 @@ struct CREATE_USN_JOURNAL_DATA {
     allocation_delta: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LUID {
+    low_part: u32,
+    high_part: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LUID_AND_ATTRIBUTES {
+    luid: LUID,
+    attributes: u32,
+}
+
+#[repr(C)]
+struct TOKEN_PRIVILEGES {
+    privilege_count: u32,
+    privileges: [LUID_AND_ATTRIBUTES; 1],
+}
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetModuleHandleW(lpModuleName: *const u16) -> *mut c_void;
@@ -415,6 +453,7 @@ unsafe extern "system" {
 
     fn GetLastError() -> u32;
     fn GetCurrentThreadId() -> u32;
+    fn GetCurrentProcess() -> *mut c_void;
     fn AttachConsole(dwProcessId: u32) -> i32;
     fn GetStdHandle(nStdHandle: u32) -> *mut c_void;
 }
@@ -446,13 +485,21 @@ const FSCTL_QUERY_USN_JOURNAL: u32 = 0x000900F4;
 const FSCTL_DELETE_USN_JOURNAL: u32 = 0x000900F8;
 const FSCTL_CREATE_USN_JOURNAL: u32 = 0x000900e7;
 const USN_DELETE_FLAG_DELETE: u32 = 0x00000001;
+const USN_DELETE_FLAG_NOTIFY: u32 = 0x00000002;
 
 const ERROR_INVALID_FUNCTION: u32 = 1;
 const ERROR_HANDLE_EOF: u32 = 38;
+const ERROR_NOT_SUPPORTED: u32 = 50;
 const ERROR_FILE_EXISTS: u32 = 80;
+const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_ALREADY_EXISTS: u32 = 183;
 const ERROR_MORE_DATA: u32 = 234;
+const ERROR_JOURNAL_DELETE_IN_PROGRESS: u32 = 1178;
 const ERROR_JOURNAL_NOT_ACTIVE: u32 = 1179;
+
+const TOKEN_ADJUST_PRIVILEGES: u32 = 0x0020;
+const TOKEN_QUERY: u32 = 0x0008;
+const SE_PRIVILEGE_ENABLED: u32 = 0x00000002;
 
 const FILE_STANDARD_INFO_CLASS: u32 = 1;
 
@@ -1376,12 +1423,131 @@ pub fn secure_single_rename(path: &Path) -> io::Result<PathBuf> {
     Ok(final_path)
 }
 
+fn enable_manage_volume_privilege() {
+    unsafe {
+        let mut token: *mut c_void = std::ptr::null_mut();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        ) == 0
+        {
+            return;
+        }
+        let _token_guard = OwnedHandle::from_raw(token);
+        let priv_name = to_wide_chars("SeManageVolumePrivilege");
+        let mut luid = LUID { low_part: 0, high_part: 0 };
+        if LookupPrivilegeValueW(std::ptr::null(), priv_name.as_ptr(), &mut luid) != 0 {
+            let tp = TOKEN_PRIVILEGES {
+                privilege_count: 1,
+                privileges: [LUID_AND_ATTRIBUTES {
+                    luid,
+                    attributes: SE_PRIVILEGE_ENABLED,
+                }],
+            };
+            AdjustTokenPrivileges(
+                token,
+                0,
+                &tp,
+                std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+        }
+    }
+}
+
+fn wait_for_usn_journal_deletion(handle: &OwnedHandle) -> io::Result<()> {
+    let mut del_notify = DELETE_USN_JOURNAL_DATA {
+        usn_journal_id: 0,
+        delete_flags: USN_DELETE_FLAG_NOTIFY,
+    };
+    let mut bytes_ret = 0u32;
+    let ret = unsafe {
+        DeviceIoControl(
+            handle.as_raw(),
+            FSCTL_DELETE_USN_JOURNAL,
+            &mut del_notify as *mut _ as *mut c_void,
+            std::mem::size_of::<DELETE_USN_JOURNAL_DATA>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_ret,
+            std::ptr::null_mut(),
+        )
+    };
+    if ret != 0 {
+        return Ok(());
+    }
+    let err = unsafe { GetLastError() };
+    if err == ERROR_JOURNAL_NOT_ACTIVE {
+        return Ok(());
+    }
+    Err(io::Error::from_raw_os_error(err as i32))
+}
+
+fn create_usn_journal_with_retry(
+    handle: &OwnedHandle,
+    volume_path: &str,
+    max_size: u64,
+    alloc_delta: u64,
+) -> io::Result<()> {
+    let mut create_data = CREATE_USN_JOURNAL_DATA {
+        maximum_size: max_size,
+        allocation_delta: alloc_delta,
+    };
+    let mut bytes_ret = 0u32;
+    let mut last_err = 0u32;
+
+    for _ in 0..30 {
+        let c_ret = unsafe {
+            DeviceIoControl(
+                handle.as_raw(),
+                FSCTL_CREATE_USN_JOURNAL,
+                &mut create_data as *mut _ as *mut c_void,
+                std::mem::size_of::<CREATE_USN_JOURNAL_DATA>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_ret,
+                std::ptr::null_mut(),
+            )
+        };
+        if c_ret != 0 {
+            return Ok(());
+        }
+        last_err = unsafe { GetLastError() };
+        if last_err == ERROR_JOURNAL_DELETE_IN_PROGRESS {
+            let _ = wait_for_usn_journal_deletion(handle);
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            continue;
+        }
+        if last_err == ERROR_INVALID_PARAMETER
+            && (create_data.maximum_size != 0 || create_data.allocation_delta != 0)
+        {
+            create_data.maximum_size = 0;
+            create_data.allocation_delta = 0;
+            continue;
+        }
+        break;
+    }
+
+    let ce = io::Error::from_raw_os_error(last_err as i32);
+    Err(io::Error::new(
+        ce.kind(),
+        format!(
+            "FSCTL_CREATE_USN_JOURNAL auf {} fehlgeschlagen (Code {}): {}",
+            volume_path, last_err, ce
+        ),
+    ))
+}
+
 /// Löscht das NTFS USN-Journal auf dem Volume von `volume_root` und legt es mit derselben Konfiguration neu an.
 /// Gibt `Ok(true)` zurück, wenn ein Journal bereinigt wurde, oder `Ok(false)`, wenn kein aktives Journal vorliegt.
 pub fn purge_volume_usn_journal(volume_root: &Path) -> io::Result<bool> {
     let Some(drive_letter) = extract_drive_letter(volume_root) else {
         return Ok(false);
     };
+
+    enable_manage_volume_privilege();
 
     let volume_path = format!(r"\\.\{}", drive_letter);
     let wide_vol = to_wide_chars(&volume_path);
@@ -1390,14 +1556,25 @@ pub fn purge_volume_usn_journal(volume_root: &Path) -> io::Result<bool> {
         CreateFileW(
             wide_vol.as_ptr(),
             GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             std::ptr::null_mut(),
             OPEN_EXISTING,
             0,
             std::ptr::null_mut(),
         )
     })
-    .ok_or_else(io::Error::last_os_error)?;
+    .ok_or_else(|| {
+        let e = io::Error::last_os_error();
+        io::Error::new(
+            e.kind(),
+            format!(
+                "Volume-Zugriff {} fehlgeschlagen (Code {:?}): {}",
+                volume_path,
+                e.raw_os_error(),
+                e
+            ),
+        )
+    })?;
 
     // 1. Aktuelle Journal-Konfiguration abfragen
     let mut journal_data = USN_JOURNAL_DATA_V0 {
@@ -1425,20 +1602,63 @@ pub fn purge_volume_usn_journal(volume_root: &Path) -> io::Result<bool> {
 
     if q_ret == 0 {
         let err = unsafe { GetLastError() };
-        if err == ERROR_JOURNAL_NOT_ACTIVE || err == ERROR_INVALID_FUNCTION {
+        if err == ERROR_JOURNAL_DELETE_IN_PROGRESS {
+            wait_for_usn_journal_deletion(&handle)?;
+            let retry_ret = unsafe {
+                DeviceIoControl(
+                    handle.as_raw(),
+                    FSCTL_QUERY_USN_JOURNAL,
+                    std::ptr::null(),
+                    0,
+                    &mut journal_data as *mut _ as *mut c_void,
+                    std::mem::size_of::<USN_JOURNAL_DATA_V0>() as u32,
+                    &mut bytes_ret,
+                    std::ptr::null_mut(),
+                )
+            };
+            if retry_ret == 0 {
+                let retry_err = unsafe { GetLastError() };
+                if retry_err == ERROR_JOURNAL_NOT_ACTIVE {
+                    create_usn_journal_with_retry(&handle, &volume_path, 0, 0)?;
+                    return Ok(true);
+                }
+                if retry_err == ERROR_INVALID_FUNCTION || retry_err == ERROR_NOT_SUPPORTED {
+                    return Ok(false);
+                }
+                let qe = io::Error::from_raw_os_error(retry_err as i32);
+                return Err(io::Error::new(
+                    qe.kind(),
+                    format!(
+                        "FSCTL_QUERY_USN_JOURNAL auf {} fehlgeschlagen (Code {}): {}",
+                        volume_path, retry_err, qe
+                    ),
+                ));
+            }
+        } else if err == ERROR_JOURNAL_NOT_ACTIVE
+            || err == ERROR_INVALID_FUNCTION
+            || err == ERROR_NOT_SUPPORTED
+        {
             return Ok(false);
+        } else {
+            let qe = io::Error::from_raw_os_error(err as i32);
+            return Err(io::Error::new(
+                qe.kind(),
+                format!(
+                    "FSCTL_QUERY_USN_JOURNAL auf {} fehlgeschlagen (Code {}): {}",
+                    volume_path, err, qe
+                ),
+            ));
         }
-        return Err(io::Error::from_raw_os_error(err as i32));
     }
 
     if journal_data.usn_journal_id == 0 {
         return Ok(false);
     }
 
-    // 2. Bestehendes Journal löschen
+    // 2. Bestehendes Journal synchron löschen (USN_DELETE_FLAG_NOTIFY wartet auf Abschluss!)
     let del_data = DELETE_USN_JOURNAL_DATA {
         usn_journal_id: journal_data.usn_journal_id,
-        delete_flags: USN_DELETE_FLAG_DELETE,
+        delete_flags: USN_DELETE_FLAG_DELETE | USN_DELETE_FLAG_NOTIFY,
     };
     let d_ret = unsafe {
         DeviceIoControl(
@@ -1455,33 +1675,27 @@ pub fn purge_volume_usn_journal(volume_root: &Path) -> io::Result<bool> {
 
     if d_ret == 0 {
         let err = unsafe { GetLastError() };
-        if err == ERROR_JOURNAL_NOT_ACTIVE {
-            return Ok(false);
+        if err == ERROR_JOURNAL_DELETE_IN_PROGRESS {
+            wait_for_usn_journal_deletion(&handle)?;
+        } else if err != ERROR_JOURNAL_NOT_ACTIVE {
+            let de = io::Error::from_raw_os_error(err as i32);
+            return Err(io::Error::new(
+                de.kind(),
+                format!(
+                    "FSCTL_DELETE_USN_JOURNAL auf {} fehlgeschlagen (Code {}): {}",
+                    volume_path, err, de
+                ),
+            ));
         }
-        return Err(io::Error::from_raw_os_error(err as i32));
     }
 
-    // 3. Journal leer mit ursprünglichen Parametern neu anlegen
-    let mut create_data = CREATE_USN_JOURNAL_DATA {
-        maximum_size: journal_data.maximum_size,
-        allocation_delta: journal_data.allocation_delta,
-    };
-    let c_ret = unsafe {
-        DeviceIoControl(
-            handle.as_raw(),
-            FSCTL_CREATE_USN_JOURNAL,
-            &mut create_data as *mut _ as *mut c_void,
-            std::mem::size_of::<CREATE_USN_JOURNAL_DATA>() as u32,
-            std::ptr::null_mut(),
-            0,
-            &mut bytes_ret,
-            std::ptr::null_mut(),
-        )
-    };
-
-    if c_ret == 0 {
-        return Err(io::Error::last_os_error());
-    }
+    // 3. Journal leer mit ursprünglichen Parametern (oder Fallback 0/0) neu anlegen
+    create_usn_journal_with_retry(
+        &handle,
+        &volume_path,
+        journal_data.maximum_size,
+        journal_data.allocation_delta,
+    )?;
 
     Ok(true)
 }
@@ -4367,6 +4581,7 @@ pub struct ShredOutcome {
     pub errors: usize,
     pub journal_purged: bool,
     pub journal_errors: usize,
+    pub journal_error_details: Vec<String>,
 }
 
 struct ShredProgressShared {
@@ -4381,6 +4596,7 @@ struct ShredProgressShared {
     errors: usize,
     journal_purged: bool,
     journal_errors: usize,
+    journal_error_details: Vec<String>,
 }
 
 struct ProgressDialogControls {
@@ -4668,6 +4884,7 @@ pub fn show_shred_progress_dialog(
                 errors: 1,
                 journal_purged: false,
                 journal_errors: 0,
+                journal_error_details: Vec::new(),
             };
         }
 
@@ -4747,6 +4964,7 @@ pub fn show_shred_progress_dialog(
             errors: 0,
             journal_purged: false,
             journal_errors: 0,
+            journal_error_details: Vec::new(),
         }));
 
         if let Ok(mut guard) = PROG_SHARED.lock() {
@@ -4812,6 +5030,7 @@ pub fn show_shred_progress_dialog(
             // 3. USN Journal Purge (wenn gewünscht & Admin & nicht abgebrochen)
             let mut journal_purged = false;
             let mut journal_errors = 0usize;
+            let mut journal_error_details = Vec::new();
             if purge_journal && is_admin && !PROG_CANCEL.load(Ordering::SeqCst) {
                 if let Ok(mut g) = shared_clone.lock() {
                     g.detail_status = "NTFS USN-Journal ($UsnJrnl) wird bereinigt...".to_string();
@@ -4826,7 +5045,9 @@ pub fn show_shred_progress_dialog(
                         Ok(false) => {}
                         Err(e) => {
                             journal_errors += 1;
-                            eprintln!("USN-Journal-Bereinigung fehlgeschlagen für {:?}: {}", vol, e);
+                            let detail = format!("{}: {}", vol.display(), e);
+                            eprintln!("USN-Journal-Bereinigung fehlgeschlagen für {}", detail);
+                            journal_error_details.push(detail);
                         }
                     }
                 }
@@ -4840,6 +5061,7 @@ pub fn show_shred_progress_dialog(
                 g.completed = true;
                 g.journal_purged = journal_purged;
                 g.journal_errors = journal_errors;
+                g.journal_error_details = journal_error_details;
                 if !cancelled {
                     g.processed_items = g.total_items;
                     g.processed_bytes = g.total_bytes;
@@ -4874,15 +5096,16 @@ pub fn show_shred_progress_dialog(
                         errors: data.errors,
                         journal_purged: data.journal_purged,
                         journal_errors: data.journal_errors,
+                        journal_error_details: data.journal_error_details.clone(),
                     }
                 } else {
-                    ShredOutcome { cancelled: false, errors: 0, journal_purged: false, journal_errors: 0 }
+                    ShredOutcome { cancelled: false, errors: 0, journal_purged: false, journal_errors: 0, journal_error_details: Vec::new() }
                 }
             } else {
-                ShredOutcome { cancelled: false, errors: 0, journal_purged: false, journal_errors: 0 }
+                ShredOutcome { cancelled: false, errors: 0, journal_purged: false, journal_errors: 0, journal_error_details: Vec::new() }
             }
         } else {
-            ShredOutcome { cancelled: false, errors: 0, journal_purged: false, journal_errors: 0 }
+            ShredOutcome { cancelled: false, errors: 0, journal_purged: false, journal_errors: 0, journal_error_details: Vec::new() }
         };
 
         if let Ok(mut guard_opt) = PROG_SHARED.lock() {
@@ -5334,12 +5557,16 @@ fn main() {
         }
         let mut journal_purged = false;
         let mut journal_errors = 0usize;
+        let mut journal_error_details = Vec::new();
         if purge_journal && is_admin {
             for vol in &affected_volumes {
                 match purge_volume_usn_journal(vol) {
                     Ok(true) => journal_purged = true,
                     Ok(false) => {}
-                    Err(_) => journal_errors += 1,
+                    Err(e) => {
+                        journal_errors += 1;
+                        journal_error_details.push(format!("{}: {}", vol.display(), e));
+                    }
                 }
             }
         }
@@ -5348,6 +5575,7 @@ fn main() {
             errors: errs,
             journal_purged,
             journal_errors,
+            journal_error_details,
         }
     } else {
         show_shred_progress_dialog(
@@ -5364,6 +5592,9 @@ fn main() {
                 "[FEHLER] Vernichtung mit {} Datei-Fehler(n) und {} Journal-Fehler(n) beendet.",
                 outcome.errors, outcome.journal_errors
             );
+            for detail in &outcome.journal_error_details {
+                eprintln!("[FEHLER] USN-Journal: {}", detail);
+            }
             std::process::exit(1);
         }
     } else {
@@ -5381,10 +5612,16 @@ fn main() {
             );
             std::process::exit(1);
         } else if outcome.journal_errors > 0 {
+            let details_block = if outcome.journal_error_details.is_empty() {
+                String::new()
+            } else {
+                format!("\n\nDetails:\n{}", outcome.journal_error_details.join("\n"))
+            };
             show_message_box(
                 &format!(
-                    "Dateien wurden unwiderruflich vernichtet, aber das NTFS USN-Journal konnte auf {} Laufwerk(en) nicht bereinigt werden.",
-                    outcome.journal_errors
+                    "Dateien wurden unwiderruflich vernichtet, aber das NTFS USN-Journal konnte auf {} Laufwerk(en) nicht bereinigt werden.{}",
+                    outcome.journal_errors,
+                    details_block
                 ),
                 "WinShred - Hinweis zur Journal-Bereinigung",
                 MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND,
@@ -5685,10 +5922,16 @@ mod tests {
     #[test]
     fn test_usn_journal_structs_and_constants() {
         assert_eq!(std::mem::size_of::<USN_JOURNAL_DATA_V0>(), 56);
+        assert_eq!(std::mem::size_of::<DELETE_USN_JOURNAL_DATA>(), 16);
+        assert_eq!(std::mem::size_of::<CREATE_USN_JOURNAL_DATA>(), 16);
+        assert_eq!(std::mem::size_of::<LUID>(), 8);
+        assert_eq!(std::mem::size_of::<TOKEN_PRIVILEGES>(), 16);
         assert_eq!(FSCTL_DELETE_USN_JOURNAL, 0x000900F8);
         assert_eq!(FSCTL_QUERY_USN_JOURNAL, 0x000900F4);
         assert_eq!(FSCTL_CREATE_USN_JOURNAL, 0x000900E7);
         assert_eq!(FSCTL_QUERY_ALLOCATED_RANGES, 0x000940CF);
+        assert_eq!(USN_DELETE_FLAG_DELETE | USN_DELETE_FLAG_NOTIFY, 0x00000003);
+        assert_eq!(ERROR_JOURNAL_DELETE_IN_PROGRESS, 1178);
 
         // Relative Pfade müssen über extract_drive_letter trotzdem ein Laufwerk liefern
         let rel = Path::new("Cargo.toml");
